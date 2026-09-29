@@ -24,15 +24,18 @@ on the run page saying what approving will do. The images then build on an
 amd64 and an arm64 runner and are pushed by digest, untagged. Read the
 summary, then approve `publish` when it pauses: it is the only job behind the
 `release` environment's reviewer, and the one that makes anything visible. It
-tags `ghcr.io/northbymidwest/mdns-alias:<version>` over both digests, attests
-its provenance, and creates the `v<version>` tag and GitHub release.
+tags `ghcr.io/northbymidwest/mdns-alias:<version>` over both digests, moves
+`latest` to it, attests its provenance and SBOM, and creates the `v<version>`
+tag and GitHub release.
 
 `dry_run` is on by default. The asymmetry is deliberate: forgetting to untick
 it costs a re-run, forgetting to tick it publishes. A dry run builds both
 images and pushes nothing.
 
-Only the exact version is tagged: there is no `latest`, and no `0.1` or `0`
-that moves. Pull the version you mean.
+Two tags per release: the exact version, which never moves once pushed, and
+`latest`, which moves to every release, including a re-release of an older
+line. There is no `0.1` or `0`. Pin the version or the digest for anything
+deployed; `latest` is for trying it out.
 
 ## What it refuses to publish
 

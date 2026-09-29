@@ -1,8 +1,8 @@
 name: release
 run-name: release ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}
 
-# Publishes ghcr.io/<owner>/mdns-alias:<version> for linux/amd64 and
-# linux/arm64, then tags v<version>, through the shared composites in
+# Publishes ghcr.io/<owner>/mdns-alias:<version>, and moves :latest to it, for
+# linux/amd64 and linux/arm64, then tags v<version>, through the shared composites in
 # northbymidwest/gh-actions for everything but the image. The tag is an output
 # of a succeeded release, never its trigger.
 #
@@ -84,7 +84,7 @@ jobs:
           version: ${{ inputs.version }}
           dry-run: ${{ inputs.dry_run }}
           tag: ${{ steps.pre.outputs.tag }}
-          what-approving-does: tags ${{ env.IMAGE }}:${{ inputs.version }} (linux/amd64, linux/arm64) and tags v${{ inputs.version }}
+          what-approving-does: tags ${{ env.IMAGE }}:${{ inputs.version }} and :latest (linux/amd64, linux/arm64) and tags v${{ inputs.version }}
           token: ${{ github.token }}
 
   build:
@@ -179,7 +179,7 @@ jobs:
             set -- "$@" "$IMAGE@$(cat "$f")"
           done
           [ "$#" -eq 2 ] || { echo "expected 2 digests, found $#" >&2; exit 1; }
-          docker buildx imagetools create --tag "$IMAGE:$VERSION" \
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" \
             --annotation "index:org.opencontainers.image.source=$SOURCE" \
             --annotation "index:org.opencontainers.image.description=Publish extra mDNS host names for this machine" \
             --annotation "index:org.opencontainers.image.licenses=0BSD" \

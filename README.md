@@ -16,8 +16,9 @@ packets on SIGTERM/SIGINT so clients drop the names immediately.
 ## Docker
 
 Released images are at `ghcr.io/northbymidwest/mdns-alias:<version>`, for
-`linux/amd64` and `linux/arm64`, tagged by exact version only. Each carries a
-build provenance attestation:
+`linux/amd64` and `linux/arm64`. `latest` follows the newest release; pin a
+version (or a digest) for anything you deploy. Each release carries build
+provenance and SBOM attestations:
 
 ```sh
 gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:<version> \
