@@ -1,6 +1,6 @@
 //! Publish extra mDNS host names (aliases) that resolve to one address.
 //!
-//! Usage: mdns-alias <address> <name.local>...
+//! Usage: `mdns-alias <address> <name.local>...`
 
 use std::error::Error;
 use std::net::IpAddr;
