@@ -8,7 +8,7 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
-## Unreleased
+## 0.1.2 - 2026-09-29
 
 ### Fixed
 
