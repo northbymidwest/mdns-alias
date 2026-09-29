@@ -8,6 +8,14 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Fixed
+
+- The release SBOM named the image `ghcr.io/*******/mdns-alias`: syft
+  redacted the registry username, which is also the image's owner. The SBOM
+  is now generated from an anonymous pull.
+
 ## 0.1.1 - 2026-09-29
 
 ### Changed

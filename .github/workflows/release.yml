@@ -196,12 +196,13 @@ jobs:
           push-to-registry: true
       # The SBOM, read out of the published image rather than the lockfile:
       # syft finds the dependency list cargo-auditable embedded in the binary.
+      # Pulled anonymously: syft redacts registry credentials wherever they
+      # appear in its output, and the username is the image's owner, so
+      # passing it would print the image as ghcr.io/*******/mdns-alias.
       - if: ${{ !inputs.dry_run }}
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.IMAGE }}@${{ steps.image.outputs.digest }}
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ github.token }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-artifact: false
