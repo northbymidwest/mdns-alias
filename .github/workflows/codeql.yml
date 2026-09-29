@@ -1,0 +1,59 @@
+name: codeql
+
+# `actions`: three workflows run unattended on a schedule and one holds
+# `issues: write`, and the bug that matters there is a `${{ }}` expanded into
+# the source of a `run:` block. `rust`: the daemon parses packets off the
+# network, through mdns-sd.
+#
+# Off the hour, and after CI's own Monday run, for the reason `ci.yml` gives.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '7 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Same rule as `ci.yml`: a second push to a branch makes the first answer
+# irrelevant, but main keeps a result for every commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # The only scope that does anything here, and the reason the actions
+      # below are pinned by commit rather than by a tag somebody else can move.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      # One language failing should not hide the other's result.
+      fail-fast: false
+      matrix:
+        include:
+          # Interpreted; `none` is the only build mode it has.
+          - language: actions
+            build-mode: none
+          # Also the only mode Rust has: CodeQL rejects `autobuild` for it.
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: /language:${{ matrix.language }}

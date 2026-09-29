@@ -1,0 +1,3 @@
+# Kept on deliberately. The bug form asks for both ends of a lookup, which is
+# right for a bug and wrong for everything else, such as a question.
+blank_issues_enabled: true

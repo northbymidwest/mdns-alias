@@ -1,0 +1,51 @@
+# Monthly: the GitHub Actions the workflows pin, and the Cargo dependencies.
+#
+# Every action is pinned to a commit, with the tag in a comment, so this is
+# the only thing that ever moves one of those pins. The upgrades that matter
+# arrive as deadlines: a runner's Node version reaching end of life takes
+# unattended workflows down with it.
+#
+# `dtolnay/rust-toolchain` chooses the compiler through its `toolchain:`
+# input, never through the ref, so a bump here moves the action and not the
+# toolchain. `msrv` reads its version from `Cargo.toml`, and the Dockerfile's
+# `rust:<version>-alpine` has to match it (the `msrv` job checks); neither is
+# a dependency this file moves, so there is no `docker` entry.
+#
+# Cargo dependencies are kept current, not held at floors: this is a binary,
+# and nothing downstream resolves against its manifest. One grouped pull
+# request a month, and `minimal_versions` in CI still checks that the
+# versions `Cargo.toml` names build.
+#
+# A week's cooldown on both: a release is not offered until it has been out
+# that long, which is the window in which a compromised or broken release
+# tends to be noticed and pulled. Security updates ignore the cooldown.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    labels: []
+    # One PR for all action bumps, so multi-`uses:` actions (e.g. codeql-action
+    # init + analyze) move together rather than in separate, version-mismatched PRs.
+    groups:
+      actions:
+        patterns:
+          - "*"
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps"
+    labels: []
+    groups:
+      cargo:
+        patterns:
+          - "*"

@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Nothing here is pinned to this repository's own activity: `stable` moves
+  # every six weeks, `beta` every day it is rebuilt, and the `rust:*-alpine`
+  # base image whenever Alpine ships a fix. Between releases nobody pushes, so
+  # a change that breaks the build would sit unseen until the next commit.
+  # Once a week, unprompted, is the whole point.
+  #
+  # Off the hour: scheduled jobs queue behind everyone else's :00 cron.
+  #
+  # GitHub disables a schedule in a public repository after 60 days without
+  # a commit, and mails the owner. A quiet stretch that long is exactly when
+  # this matters, so treat that mail as a prompt to re-enable it.
+  schedule:
+    - cron: '37 6 * * 1'
+  # So the schedule's path can be exercised without waiting for Monday.
+  workflow_dispatch:
+
+# No job here writes anything back: they build, test and lint a checkout. The
+# default token is read-write, so this drops it to what is actually used.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's answer irrelevant.
+# Cancel it rather than queue behind it. `github.ref` keeps branches and PRs
+# in separate groups, so a push to main never cancels a PR's run.
+#
+# Not on main, though: commits land there directly, and cancelling would
+# leave a commit with no result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Linux is where this runs; macOS is where it gets developed, and has its
+  # own responder (mDNSResponder) sharing port 5353. Windows is left out:
+  # nothing here targets it.
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test
+      - run: cargo build --release
+
+  # `test` above already runs the newest stable. This job is the release that
+  # has not happened yet: a regression caught here is six weeks from reaching
+  # anyone.
+  beta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: beta
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test
+
+  # The floor is `rust-version` in the manifest, read from there rather than
+  # repeated here: a bump that touched one and not the other would leave this
+  # job testing a compiler the manifest no longer admits. The Dockerfile's
+  # `rust:<version>-alpine` builds on the same floor.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: floor
+        run: |
+          v=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          [ -n "$v" ] || { echo 'no rust-version in Cargo.toml' >&2; exit 1; }
+          grep -q "^FROM rust:$v-alpine " Dockerfile \
+            || { echo "Dockerfile does not build on rust:$v-alpine" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test
+
+  # The floors in Cargo.toml are a promise: build against exactly these
+  # versions and this works. Every other job resolves to the newest compatible
+  # release, so none of them exercises one. `-Z direct-minimal-versions` pins
+  # every direct dependency to its declared floor and builds that. Nightly
+  # because the flag is unstable, and uncached because nightly changes daily.
+  minimal_versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: nightly
+      - run: cargo update -Z direct-minimal-versions
+      - run: cargo test
+
+  # The image, on both architectures it will be pulled on, natively rather
+  # than under emulation. Then the one check the image itself can answer:
+  # that the binary starts in it at all. Run with no arguments it prints the
+  # usage and exits 1; anything else (a missing loader, a dynamic link that
+  # slipped in) fails differently.
+  docker:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t mdns-alias:ci .
+      - run: |
+          set +e
+          out=$(docker run --rm --read-only --cap-drop ALL \
+            --security-opt no-new-privileges mdns-alias:ci 2>&1)
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [ "$code" -eq 1 ] && printf '%s\n' "$out" | grep -q '^mdns-alias: usage:'
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # The repository is ASCII only. `.githooks/pre-commit` runs the same
+      # script, but hooks are per-clone and `--no-verify` skips them, so this
+      # is where it is actually enforced.
+      - run: scripts/check-ascii.sh
+      # Spelling, over the whole tree.
+      - uses: crate-ci/typos@4d9c206a77c041268485162b8e2579ad7a5cb9a3 # v1.50.0
+      # A dependency nothing imports.
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+        with:
+          tool: cargo-machete@0.9.2
+      - run: cargo machete
+
+  # Licenses, duplicate versions and sources, against `deny.toml`. The
+  # policy is no copyleft; advisories are `audit.yml`'s.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check licenses bans sources
+
+  # The workflows themselves. actionlint reads the YAML against GitHub's
+  # schema and runs shellcheck over every script; zizmor is the security
+  # half: template injection, an action that is not pinned to a commit, a
+  # checkout that leaves its credential on disk, a permission a job does not
+  # use. Both are blocking. zizmor runs twice on purpose: the action uploads
+  # to code scanning and does not fail the job in that mode; the plain run is
+  # the one that fails. Both are online, with a token, since some audits need
+  # the API. `.github`, not `.github/workflows`: `dependabot.yml` has audits
+  # of its own.
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # SC2016 is "expressions don't expand in single quotes": the issue
+      # bodies quote markdown code fences in single quotes on purpose.
+      - run: actionlint
+        env:
+          SHELLCHECK_OPTS: -e SC2016
+      - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          version: 1.29.0
+          inputs: .github
+          advanced-security: true
+      - run: pipx install zizmor==1.29.0
+      - run: zizmor --no-progress .github
+        env:
+          GH_TOKEN: ${{ github.token }}

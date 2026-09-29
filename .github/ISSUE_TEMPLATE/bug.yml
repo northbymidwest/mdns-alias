@@ -1,0 +1,67 @@
+name: Bug report
+description: A name that does not resolve, or resolves wrong
+labels: ["bug"]
+assignees: ["northbymidwest"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Whether a name resolves depends on both ends: the machine publishing it
+        and the one looking it up, and the mDNS software on each. Those are
+        asked for below even when they seem beside the point.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem
+      options:
+        - A name does not resolve
+        - A name resolves to the wrong address
+        - It will not start, or exits
+        - A name lingers after it stops
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead. Include the daemon's output.
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command line
+      description: How the daemon was started, with its arguments.
+      placeholder: "mdns-alias 192.0.2.10 app.myhost.local"
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Publishing host
+      description: OS, whether it runs in the Docker image, and the other mDNS responder on that machine.
+      placeholder: "Ubuntu 26.04, Docker image, systemd-resolved"
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: Client
+      description: The OS doing the lookup, and how you looked the name up.
+      placeholder: "macOS 26, dscacheutil -q host -a name app.myhost.local"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: mdns-alias version
+      placeholder: "0.1.0"
+    validations:
+      required: true
