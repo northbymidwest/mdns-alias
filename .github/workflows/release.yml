@@ -9,8 +9,8 @@ run-name: release ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' 
 # Each architecture builds natively on its own runner and pushes by digest
 # only: untagged, so nothing can pull it by name. `publish` is the one job
 # behind the `release` environment's reviewer, and everything a user can see
-# happens there: the version tag joining the two digests, the provenance
-# attestation, and the git tag. The build jobs push before approval because
+# happens there: the version tag joining the two digests, the provenance and
+# SBOM attestations, and the git tag. The build jobs push before approval because
 # the alternative is a second approval: every job naming the environment
 # waits for its own review, and the tag key is an environment secret.
 on:
@@ -186,11 +186,32 @@ jobs:
             "$@"
           digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # Build provenance: which workflow, commit and runner produced this
+      # digest. `actions/attest` with no predicate input makes SLSA provenance.
       - if: ${{ !inputs.dry_run }}
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      # The SBOM, read out of the published image rather than the lockfile:
+      # syft finds the dependency list cargo-auditable embedded in the binary.
+      - if: ${{ !inputs.dry_run }}
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.image.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ github.token }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          dependency-snapshot: false
+      - if: ${{ !inputs.dry_run }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: sbom.spdx.json
           push-to-registry: true
       - uses: northbymidwest/gh-actions/release-tag@010696da1a1dc686d7931c4aab81f8bb02721613 # v0.5.2
         with:

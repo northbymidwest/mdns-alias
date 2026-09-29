@@ -2,6 +2,8 @@
 //!
 //! Usage: `mdns-alias <address> <name.local>...`
 
+#![forbid(unsafe_code)]
+
 use std::error::Error;
 use std::net::IpAddr;
 use std::process::ExitCode;

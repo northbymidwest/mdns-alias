@@ -75,7 +75,7 @@ jobs:
   # The floor is `rust-version` in the manifest, read from there rather than
   # repeated here: a bump that touched one and not the other would leave this
   # job testing a compiler the manifest no longer admits. The Dockerfile's
-  # `rust:<version>-alpine` builds on the same floor.
+  # `rust:<version>-alpine` builds on the same floor, pinned by digest.
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -87,8 +87,8 @@ jobs:
         run: |
           v=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
           [ -n "$v" ] || { echo 'no rust-version in Cargo.toml' >&2; exit 1; }
-          grep -q "^FROM rust:$v-alpine " Dockerfile \
-            || { echo "Dockerfile does not build on rust:$v-alpine" >&2; exit 1; }
+          grep -q "^FROM rust:$v-alpine@sha256:[0-9a-f]\{64\} " Dockerfile \
+            || { echo "Dockerfile does not build on a digest-pinned rust:$v-alpine" >&2; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
@@ -115,10 +115,11 @@ jobs:
       - run: cargo test
 
   # The image, on both architectures it will be pulled on, natively rather
-  # than under emulation. Then the one check the image itself can answer:
-  # that the binary starts in it at all. Run with no arguments it prints the
-  # usage and exits 1; anything else (a missing loader, a dynamic link that
-  # slipped in) fails differently.
+  # than under emulation. Then the checks the image itself can answer: that
+  # the binary starts in it at all (run with no arguments it prints the usage
+  # and exits 1; a missing loader or a dynamic link that slipped in fails
+  # differently), and that it carries its dependency list, audited as
+  # shipped rather than as the lockfile says.
   docker:
     strategy:
       matrix:
@@ -138,6 +139,18 @@ jobs:
           set -e
           printf '%s\n' "$out"
           [ "$code" -eq 1 ] && printf '%s\n' "$out" | grep -q '^mdns-alias: usage:'
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-audit@0.22.2
+      # `cargo audit bin` falls back to guessing from panic messages when the
+      # auditable section is missing, so its absence is checked on its own.
+      - run: |
+          id=$(docker create mdns-alias:ci)
+          docker cp "$id:/mdns-alias" mdns-alias
+          docker rm "$id" >/dev/null
+          readelf -S mdns-alias | grep -q '\.dep-v0' \
+            || { echo 'no cargo-auditable data in the binary' >&2; exit 1; }
+          cargo audit bin mdns-alias
 
   lint:
     runs-on: ubuntu-latest

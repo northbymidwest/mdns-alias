@@ -8,6 +8,17 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Changed
+
+- The binary is built with `cargo auditable`, so its exact dependency list is
+  embedded and scanners can read it out of the image. CI audits the shipped
+  binary with `cargo audit bin`, and each release attests an SPDX SBOM
+  alongside its build provenance.
+- The build image is pinned by digest, and `#![forbid(unsafe_code)]` keeps
+  the crate free of `unsafe`.
+
 ## 0.1.0 - 2026-09-29
 
 ### Added

@@ -1,4 +1,5 @@
-# Monthly: the GitHub Actions the workflows pin, and the Cargo dependencies.
+# Monthly: the GitHub Actions the workflows pin, the Cargo dependencies, and
+# the Dockerfile's base image digest.
 #
 # Every action is pinned to a commit, with the tag in a comment, so this is
 # the only thing that ever moves one of those pins. The upgrades that matter
@@ -7,9 +8,12 @@
 #
 # `dtolnay/rust-toolchain` chooses the compiler through its `toolchain:`
 # input, never through the ref, so a bump here moves the action and not the
-# toolchain. `msrv` reads its version from `Cargo.toml`, and the Dockerfile's
-# `rust:<version>-alpine` has to match it (the `msrv` job checks); neither is
-# a dependency this file moves, so there is no `docker` entry.
+# toolchain. `msrv` reads its version from `Cargo.toml`.
+#
+# The Dockerfile's base image is `rust:<msrv>-alpine`, pinned by digest. The
+# tag is the MSRV and moves only with `rust-version` (the `msrv` job checks
+# they match), so version updates are ignored; what is left is the digest,
+# which moves when the image is rebuilt with Alpine's fixes.
 #
 # Cargo dependencies are kept current, not held at floors: this is a binary,
 # and nothing downstream resolves against its manifest. One grouped pull
@@ -49,3 +53,18 @@ updates:
       cargo:
         patterns:
           - "*"
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "docker"
+    labels: []
+    ignore:
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
