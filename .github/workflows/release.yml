@@ -1,0 +1,200 @@
+name: release
+run-name: release ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}
+
+# Publishes ghcr.io/<owner>/mdns-alias:<version> for linux/amd64 and
+# linux/arm64, then tags v<version>, through the shared composites in
+# northbymidwest/gh-actions for everything but the image. The tag is an output
+# of a succeeded release, never its trigger.
+#
+# Each architecture builds natively on its own runner and pushes by digest
+# only: untagged, so nothing can pull it by name. `publish` is the one job
+# behind the `release` environment's reviewer, and everything a user can see
+# happens there: the version tag joining the two digests, the provenance
+# attestation, and the git tag. The build jobs push before approval because
+# the alternative is a second approval: every job naming the environment
+# waits for its own review, and the tag key is an environment secret.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the leading v (e.g. 0.1.0)'
+        type: string
+        required: true
+      dry_run:
+        description: 'Build, but push and tag nothing'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  SOURCE: ${{ github.server_url }}/${{ github.repository }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    # Must exceed release-preflight's ci-wait-minutes (30).
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `crates` is for manifests that go to crates.io, and refuses
+      # `publish = false`; this one never does, so it is only a manifest whose
+      # version must match.
+      - id: pre
+        uses: northbymidwest/gh-actions/release-preflight@010696da1a1dc686d7931c4aab81f8bb02721613 # v0.5.2
+        with:
+          version: ${{ inputs.version }}
+          dry-run: ${{ inputs.dry_run }}
+          crates: ''
+          manifests: Cargo.toml
+          token: ${{ github.token }}
+      # A version tag is never moved. Before the first release the package
+      # does not exist, and the lookup fails the same way as for a free tag.
+      - name: Image tag is free
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            if [ "$DRY_RUN" = true ]; then
+              echo "::warning::$IMAGE:$VERSION already exists"
+            else
+              echo "::error::$IMAGE:$VERSION already exists"
+              exit 1
+            fi
+          fi
+      - uses: northbymidwest/gh-actions/release-review-summary@010696da1a1dc686d7931c4aab81f8bb02721613 # v0.5.2
+        with:
+          version: ${{ inputs.version }}
+          dry-run: ${{ inputs.dry_run }}
+          tag: ${{ steps.pre.outputs.tag }}
+          what-approving-does: tags ${{ env.IMAGE }}:${{ inputs.version }} (linux/amd64, linux/arm64) and tags v${{ inputs.version }}
+          token: ${{ github.token }}
+
+  build:
+    needs: preflight
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The docker-container driver, for push-by-digest. Provenance and SBOM
+      # attestations are off here: they would add manifests to the image
+      # index, and provenance is attested once, on the final digest, in
+      # `publish`.
+      - name: Build, and push by digest
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          docker buildx create --use --driver docker-container >/dev/null
+          if [ "$DRY_RUN" = true ]; then
+            output=type=cacheonly
+          else
+            printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+            output="type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true"
+          fi
+          docker buildx build . \
+            --platform "linux/$ARCH" \
+            --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.licenses=0BSD" \
+            --output "$output" \
+            --metadata-file meta.json
+          if [ "$DRY_RUN" != true ]; then
+            digest=$(jq -r '."containerimage.digest"' meta.json)
+            printf '%s\n' "$digest" > "digest-$ARCH"
+          fi
+      - if: ${{ !inputs.dry_run }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [preflight, build]
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: ${{ !inputs.dry_run }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - id: image
+        if: ${{ !inputs.dry_run }}
+        name: Tag the multi-arch image
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          set --
+          for f in digests/digest-*; do
+            set -- "$@" "$IMAGE@$(cat "$f")"
+          done
+          [ "$#" -eq 2 ] || { echo "expected 2 digests, found $#" >&2; exit 1; }
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE" \
+            --annotation "index:org.opencontainers.image.description=Publish extra mDNS host names for this machine" \
+            --annotation "index:org.opencontainers.image.licenses=0BSD" \
+            "$@"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - if: ${{ !inputs.dry_run }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      - uses: northbymidwest/gh-actions/release-tag@010696da1a1dc686d7931c4aab81f8bb02721613 # v0.5.2
+        with:
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.RELEASE_TAG_KEY }}
+          token: ${{ github.token }}
+          dry-run: ${{ inputs.dry_run }}

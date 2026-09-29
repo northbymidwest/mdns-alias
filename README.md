@@ -15,6 +15,15 @@ packets on SIGTERM/SIGINT so clients drop the names immediately.
 
 ## Docker
 
+Released images are at `ghcr.io/northbymidwest/mdns-alias:<version>`, for
+`linux/amd64` and `linux/arm64`, tagged by exact version only. Each carries a
+build provenance attestation:
+
+```sh
+gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:<version> \
+  --owner northbymidwest
+```
+
 The image contains only the static binary. It needs the host's network to
 reach the LAN, and nothing else: it runs as a non-root user, and port 5353 is
 unprivileged.
@@ -22,7 +31,7 @@ unprivileged.
 ```yaml
 services:
   mdns-alias:
-    build: path/to/mdns-alias
+    image: ghcr.io/northbymidwest/mdns-alias:<version>
     network_mode: host
     command: ["192.0.2.10", "app.myhost.local"]
     read_only: true
