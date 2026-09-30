@@ -28,12 +28,12 @@ the CNAME to the target's addresses.
 ## Docker
 
 Released images are at `ghcr.io/northbymidwest/mdns-alias:<version>`, for
-`linux/amd64` and `linux/arm64`. `latest` follows the newest release; pin a
-version (or a digest) for anything you deploy. Each release carries build
-provenance and SBOM attestations:
+`linux/amd64` and `linux/arm64`. The current release is `0.2.0`. `latest`
+follows the newest release; pin a version (or a digest) for anything you
+deploy. Each release carries build provenance and SBOM attestations:
 
 ```sh
-gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:<version> \
+gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.2.0 \
   --owner northbymidwest
 ```
 
@@ -45,7 +45,7 @@ the default target is right.
 ```yaml
 services:
   mdns-alias:
-    image: ghcr.io/northbymidwest/mdns-alias:<version>
+    image: ghcr.io/northbymidwest/mdns-alias:0.2.0
     network_mode: host
     command: ["app.myhost.local"]
     read_only: true
@@ -53,6 +53,13 @@ services:
     security_opt: [no-new-privileges]
     restart: unless-stopped
 ```
+
+`no-new-privileges` can stop the container from starting at all on some
+Docker installs, notably the Ubuntu snap: its AppArmor setup needs a profile
+transition to exec the binary, which `no-new-privileges` forbids, and the
+container exits with `exec /mdns-alias: operation not permitted`. If that
+happens, drop that line; the non-root user, `cap_drop: [ALL]` and the
+read-only filesystem still apply.
 
 ## How it works
 
