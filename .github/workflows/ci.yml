@@ -130,7 +130,9 @@ jobs:
       - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-fuzz@0.13.2
-      - run: cargo fuzz run parse -- -max_total_time=60
+      # The prebuilt cargo-fuzz is a musl binary and defaults to its own
+      # target, where the sanitizer cannot link. Name the runner's instead.
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu parse -- -max_total_time=60
 
   # The image, on both architectures it will be pulled on, natively rather
   # than under emulation. Then the checks the image itself can answer: that
