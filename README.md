@@ -1,17 +1,29 @@
 # mdns-alias
 
-Publishes extra mDNS host names that resolve to one address, alongside
-whatever mDNS responder the host already runs (systemd-resolved, Avahi,
-mDNSResponder). Useful for giving services on one machine their own `.local`
-names, such as `app.myhost.local`.
+Publishes extra mDNS host names for a machine, each a CNAME of the machine's
+own `.local` name, alongside whatever mDNS responder the host already runs
+(systemd-resolved, Avahi, mDNSResponder). Useful for giving services on one
+machine their own `.local` names, such as `app.myhost.local`, that follow the
+machine's address wherever DHCP puts it.
 
 ```sh
-mdns-alias <address> <name.local>...
-mdns-alias 192.0.2.10 app.myhost.local
+mdns-alias [--target <name.local>] [--interface <name>]... <alias.local>...
+mdns-alias app.myhost.local media.myhost.local
 ```
 
-It answers only on the interface that holds `<address>`, and sends goodbye
-packets on SIGTERM/SIGINT so clients drop the names immediately.
+The target defaults to this host's name plus `.local` (read from
+`/proc/sys/kernel/hostname`, so elsewhere than Linux `--target` is required).
+It answers on every interface that is up, except loopback, point-to-point and
+container interfaces (`docker*`, `br-*`, `veth*`); `--interface`, repeatable,
+names the interfaces to use instead. Interfaces are rescanned every 30
+seconds.
+
+Before publishing, it probes each name, and it exits with an error if another
+device already answers for one, or starts to later. It sends goodbye packets
+on SIGTERM/SIGINT so clients drop the names immediately.
+
+Tested against macOS and iOS clients, whose resolver (mDNSResponder) follows
+the CNAME to the target's addresses.
 
 ## Docker
 
@@ -27,14 +39,15 @@ gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:<version> \
 
 The image contains only the static binary. It needs the host's network to
 reach the LAN, and nothing else: it runs as a non-root user, and port 5353 is
-unprivileged.
+unprivileged. With `network_mode: host` the container has the host's name, so
+the default target is right.
 
 ```yaml
 services:
   mdns-alias:
     image: ghcr.io/northbymidwest/mdns-alias:<version>
     network_mode: host
-    command: ["192.0.2.10", "app.myhost.local"]
+    command: ["app.myhost.local"]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges]
@@ -43,11 +56,16 @@ services:
 
 ## How it works
 
-[mdns-sd](https://crates.io/crates/mdns-sd) has no bare address records, but
-answers A/AAAA queries for the host name of any service it registers. Each
-alias is registered as a placeholder `_mdns-alias._tcp` service whose host name
-is the alias. The mDNS socket is shared with the host's responder via
-`SO_REUSEADDR`, which systemd-resolved deliberately allows.
+Each alias is published as a single record, `alias CNAME <host>.local`. The
+host's own responder already answers for `<host>.local`, so a client that
+asks for the alias gets the CNAME from mdns-alias, then the addresses from
+the host. No address is configured here, and none goes stale.
+
+mdns-alias is a small mDNS responder of its own (RFC 6762: probing,
+announcing, known-answer suppression, rate limiting, legacy unicast replies),
+over IPv4 and IPv6. Its sockets share port 5353 with the host's responder via
+`SO_REUSEADDR` and `SO_REUSEPORT`, which systemd-resolved deliberately
+allows.
 
 ## License
 

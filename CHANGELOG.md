@@ -8,6 +8,28 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Changed
+
+- Breaking: the command line is now `mdns-alias [--target <name.local>]
+  [--interface <name>]... <alias.local>...`. Each alias is published as a
+  CNAME of the target, which defaults to this host's `.local` name, instead
+  of resolving to an address given on the command line. Aliases follow the
+  host's address, and there is no address to update.
+- Names are no longer registered as placeholder `_mdns-alias._tcp` services,
+  so service browsers stop listing them.
+- Each name is probed before it is published, and mdns-alias exits with an
+  error naming the other device if the name is already taken, or taken later.
+- Answers over IPv6 as well as IPv4, on every suitable interface rather than
+  only the one holding a given address. Interfaces are rescanned every 30
+  seconds.
+
+### Removed
+
+- The mdns-sd dependency, and with it most of the dependency tree. The
+  responder is now part of mdns-alias.
+
 ## 0.1.3 - 2026-09-29
 
 ### Added
