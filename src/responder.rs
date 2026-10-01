@@ -10,17 +10,15 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::wire::{
-    self, CLASS_ANY, CLASS_IN, Message, Name, Question, RData, Record, TYPE_A, TYPE_AAAA, TYPE_ANY,
-    TYPE_CNAME, TYPE_NSEC,
-};
+use crate::net::IfIndex;
+use crate::wire::{self, Class, Message, Name, Question, RData, RType, Record};
 
 pub const MDNS_PORT: u16 = 5353;
 /// TTL for host name records (RFC 6762 section 10).
-pub const TTL: u32 = 120;
+const TTL: u32 = 120;
 /// Largest packet sent: a 1500-byte MTU less IPv6 and UDP headers, rounded
 /// down.
-pub const MAX_PACKET: usize = 1440;
+const MAX_PACKET: usize = 1440;
 /// Longest random wait before the first probe (RFC 6762 section 8.1).
 const PROBE_WAIT_MAX: u64 = 250;
 const PROBE_INTERVAL: u64 = 250;
@@ -48,17 +46,27 @@ pub enum Mode {
     Cname(Name),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Family {
     V4,
     V6,
 }
 
+/// `IPv4` or `IPv6`, for logs.
+impl fmt::Display for Family {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Family::V4 => "IPv4",
+            Family::V6 => "IPv6",
+        })
+    }
+}
+
 /// One interface in one address family. Each is probed, announced and
 /// answered on separately.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Link {
-    pub index: u32,
+    pub index: IfIndex,
     pub family: Family,
 }
 
@@ -137,13 +145,18 @@ enum Phase {
     Announced,
 }
 
+/// One of the aliases, by its position in the list `Responder::new` was
+/// given. Made only by `Records`, from that list, so it is always in range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AliasId(usize);
+
 #[derive(Debug)]
 struct LinkState {
     phase: Phase,
-    /// When each record set (alias index, type) was last multicast here.
-    last_multicast: Vec<((usize, u16), u64)>,
+    /// When each record set (alias, type) was last multicast here.
+    last_multicast: Vec<((AliasId, RType), u64)>,
     /// Aliases already reported as too big for one packet here.
-    oversized: Vec<usize>,
+    oversized: Vec<AliasId>,
 }
 
 impl LinkState {
@@ -155,23 +168,23 @@ impl LinkState {
         }
     }
 
-    /// Every record set of `aliases` aliases was just multicast.
-    fn mark_all(&mut self, aliases: usize, now: u64) {
-        for i in 0..aliases {
-            for rtype in [TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_NSEC] {
-                self.set_last((i, rtype), now);
+    /// Every record set of every alias in `records` was just multicast.
+    fn mark_all(&mut self, records: &Records, now: u64) {
+        for (id, _) in records.iter() {
+            for rtype in [RType::A, RType::AAAA, RType::CNAME, RType::NSEC] {
+                self.set_last((id, rtype), now);
             }
         }
     }
 
     /// When record set `key` was last multicast here.
-    fn last(&self, key: (usize, u16)) -> Option<u64> {
+    fn last(&self, key: (AliasId, RType)) -> Option<u64> {
         let found = self.last_multicast.iter().find(|(k, _)| *k == key);
         found.map(|&(_, at)| at)
     }
 
     /// Records that record set `key` was multicast here at `now`.
-    fn set_last(&mut self, key: (usize, u16), now: u64) {
+    fn set_last(&mut self, key: (AliasId, RType), now: u64) {
         match self.last_multicast.iter_mut().find(|(k, _)| *k == key) {
             Some(entry) => entry.1 = now,
             None => self.last_multicast.push((key, now)),
@@ -186,99 +199,116 @@ struct Records {
 }
 
 impl Records {
-    fn alias_index(&self, name: &Name) -> Option<usize> {
-        self.aliases.iter().position(|alias| alias == name)
+    /// The alias `name` is, ignoring case.
+    fn alias_index(&self, name: &Name) -> Option<AliasId> {
+        self.aliases
+            .iter()
+            .position(|alias| alias == name)
+            .map(AliasId)
     }
 
-    fn record(&self, i: usize, rtype: u16, rdata: RData, ttl: u32, cache_flush: bool) -> Record {
+    /// Every alias, in order, with its id.
+    fn iter(&self) -> impl Iterator<Item = (AliasId, &Name)> {
+        self.aliases
+            .iter()
+            .enumerate()
+            .map(|(i, alias)| (AliasId(i), alias))
+    }
+
+    fn name(&self, id: AliasId) -> &Name {
+        &self.aliases[id.0]
+    }
+
+    fn record(&self, id: AliasId, rdata: RData, ttl: u32, cache_flush: bool) -> Record {
         Record {
-            name: self.aliases[i].clone(),
-            rtype,
-            class: CLASS_IN,
+            name: self.name(id).clone(),
+            class: Class::IN,
             cache_flush,
             ttl,
             rdata,
         }
     }
 
-    /// Every record published for alias `i` on an interface with `addrs`
+    /// Every record published for alias `id` on an interface with `addrs`
     /// (sorted). Empty in address mode when there are no addresses.
-    fn set(&self, i: usize, addrs: &[IpAddr], ttl: u32, cache_flush: bool) -> Vec<Record> {
+    fn set(&self, id: AliasId, addrs: &[IpAddr], ttl: u32, cache_flush: bool) -> Vec<Record> {
         match &self.mode {
             Mode::Cname(host) => {
-                vec![self.record(i, TYPE_CNAME, RData::Cname(host.clone()), ttl, cache_flush)]
+                vec![self.record(id, RData::Cname(host.clone()), ttl, cache_flush)]
             }
             Mode::Addresses => {
                 let mut set: Vec<Record> = addrs
                     .iter()
-                    .map(|addr| match *addr {
-                        IpAddr::V4(v4) => self.record(i, TYPE_A, RData::A(v4), ttl, cache_flush),
-                        IpAddr::V6(v6) => {
-                            self.record(i, TYPE_AAAA, RData::Aaaa(v6), ttl, cache_flush)
-                        }
+                    .map(|addr| {
+                        let rdata = match *addr {
+                            IpAddr::V4(v4) => RData::A(v4),
+                            IpAddr::V6(v6) => RData::Aaaa(v6),
+                        };
+                        self.record(id, rdata, ttl, cache_flush)
                     })
                     .collect();
                 let v4 = addrs.iter().any(IpAddr::is_ipv4);
                 let v6 = addrs.iter().any(IpAddr::is_ipv6);
                 if v4 != v6 {
-                    set.push(self.nsec(i, addrs, ttl, cache_flush));
+                    set.push(self.nsec(id, addrs, ttl, cache_flush));
                 }
                 set
             }
         }
     }
 
-    /// The NSEC naming the address types alias `i` has here (RFC 6762
+    /// The NSEC naming the address types alias `id` has here (RFC 6762
     /// section 6.1).
-    fn nsec(&self, i: usize, addrs: &[IpAddr], ttl: u32, cache_flush: bool) -> Record {
+    fn nsec(&self, id: AliasId, addrs: &[IpAddr], ttl: u32, cache_flush: bool) -> Record {
         let mut types = Vec::new();
         if addrs.iter().any(IpAddr::is_ipv4) {
-            types.push(TYPE_A);
+            types.push(RType::A);
         }
         if addrs.iter().any(IpAddr::is_ipv6) {
-            types.push(TYPE_AAAA);
+            types.push(RType::AAAA);
         }
-        let next = self.aliases[i].clone();
-        self.record(i, TYPE_NSEC, RData::Nsec { next, types }, ttl, cache_flush)
+        let types = types.into_iter().collect();
+        let next = self.name(id).clone();
+        self.record(id, RData::Nsec { next, types }, ttl, cache_flush)
     }
 
     /// The answers and additional records for a question of `qtype` about
-    /// alias `i`, on an interface with `addrs`. A question for A gets the
+    /// alias `id`, on an interface with `addrs`. A question for A gets the
     /// AAAA records (or NSEC) as additional records and the other way round
     /// (RFC 6762 section 6.2); a type the alias does not have gets the NSEC.
     fn reply(
         &self,
-        i: usize,
+        id: AliasId,
         addrs: &[IpAddr],
-        qtype: u16,
+        qtype: RType,
         ttl: u32,
         cache_flush: bool,
     ) -> (Vec<Record>, Vec<Record>) {
         match &self.mode {
             Mode::Cname(_) => {
-                if matches!(qtype, TYPE_A | TYPE_AAAA | TYPE_CNAME | TYPE_ANY) {
-                    (self.set(i, addrs, ttl, cache_flush), Vec::new())
+                if matches!(qtype, RType::A | RType::AAAA | RType::CNAME | RType::ANY) {
+                    (self.set(id, addrs, ttl, cache_flush), Vec::new())
                 } else {
                     (Vec::new(), Vec::new())
                 }
             }
             Mode::Addresses => {
-                let set = self.set(i, addrs, ttl, cache_flush);
+                let set = self.set(id, addrs, ttl, cache_flush);
                 if set.is_empty() {
                     return (Vec::new(), Vec::new());
                 }
-                if qtype == TYPE_ANY {
+                if qtype == RType::ANY {
                     return (set, Vec::new());
                 }
                 let (mut answers, mut additionals): (Vec<Record>, Vec<Record>) = set
                     .into_iter()
-                    .partition(|r| r.rtype == qtype && qtype != TYPE_NSEC);
-                if !matches!(qtype, TYPE_A | TYPE_AAAA) {
+                    .partition(|r| r.rtype() == qtype && qtype != RType::NSEC);
+                if !matches!(qtype, RType::A | RType::AAAA) {
                     additionals.clear();
                 }
                 if answers.is_empty() {
-                    additionals.retain(|r| r.rtype != TYPE_NSEC);
-                    answers.push(self.nsec(i, addrs, ttl, cache_flush));
+                    additionals.retain(|r| r.rtype() != RType::NSEC);
+                    answers.push(self.nsec(id, addrs, ttl, cache_flush));
                 }
                 (answers, additionals)
             }
@@ -290,9 +320,8 @@ impl Records {
     fn contradicts(&self, rec: &Record, ours: &[IpAddr]) -> bool {
         match &self.mode {
             Mode::Cname(host) => {
-                !(rec.rtype == TYPE_CNAME
-                    && rec.class == CLASS_IN
-                    && rec.rdata == RData::Cname(host.clone()))
+                !(rec.class == Class::IN
+                    && matches!(&rec.rdata, RData::Cname(target) if target == host))
             }
             Mode::Addresses => match &rec.rdata {
                 RData::A(addr) => !ours.contains(&IpAddr::V4(*addr)),
@@ -300,10 +329,12 @@ impl Records {
                 // An NSEC naming only address types agrees with us; anything
                 // else claims the name has other data.
                 RData::Nsec { types, .. } => {
-                    types.is_empty() || types.iter().any(|t| !matches!(*t, TYPE_A | TYPE_AAAA))
+                    types.is_empty() || types.iter().any(|t| !matches!(t, RType::A | RType::AAAA))
                 }
                 RData::Cname(_) => true,
-                RData::Other(_) => matches!(rec.rtype, TYPE_A | TYPE_AAAA | TYPE_NSEC | TYPE_CNAME),
+                RData::Other { rtype, .. } => {
+                    matches!(*rtype, RType::A | RType::AAAA | RType::NSEC | RType::CNAME)
+                }
             },
         }
     }
@@ -321,20 +352,21 @@ enum Kind {
 
 /// Messages of `kind` for every alias on an interface with `addrs`, packed
 /// into packets, and the aliases too big for any packet.
-fn build(records: &Records, addrs: &[IpAddr], kind: Kind) -> (Vec<Vec<u8>>, Vec<usize>) {
-    let parts = (0..records.aliases.len())
-        .filter_map(|i| {
+fn build(records: &Records, addrs: &[IpAddr], kind: Kind) -> (Vec<Vec<u8>>, Vec<AliasId>) {
+    let parts = records
+        .iter()
+        .filter_map(|(id, alias)| {
             let part = match kind {
                 Kind::Probe { unicast_response } => {
-                    let authorities = records.set(i, addrs, TTL, false);
+                    let authorities = records.set(id, addrs, TTL, false);
                     if authorities.is_empty() {
                         return None;
                     }
                     Message {
                         questions: vec![Question {
-                            name: records.aliases[i].clone(),
-                            qtype: TYPE_ANY,
-                            qclass: CLASS_IN,
+                            name: alias.clone(),
+                            qtype: RType::ANY,
+                            qclass: Class::IN,
                             unicast_response,
                         }],
                         authorities,
@@ -342,7 +374,7 @@ fn build(records: &Records, addrs: &[IpAddr], kind: Kind) -> (Vec<Vec<u8>>, Vec<
                     }
                 }
                 Kind::Announce { ttl } => {
-                    let answers = records.set(i, addrs, ttl, true);
+                    let answers = records.set(id, addrs, ttl, true);
                     if answers.is_empty() {
                         return None;
                     }
@@ -352,7 +384,7 @@ fn build(records: &Records, addrs: &[IpAddr], kind: Kind) -> (Vec<Vec<u8>>, Vec<
                     }
                 }
             };
-            Some((i, part))
+            Some((id, part))
         })
         .collect();
     pack(matches!(kind, Kind::Announce { .. }), parts)
@@ -361,21 +393,27 @@ fn build(records: &Records, addrs: &[IpAddr], kind: Kind) -> (Vec<Vec<u8>>, Vec<
 /// Goodbyes for what an interface published with `old` addresses and no
 /// longer does with `new`.
 fn retired(records: &Records, old: &[IpAddr], new: &[IpAddr]) -> Vec<Vec<u8>> {
-    let parts = (0..records.aliases.len())
-        .filter_map(|i| {
-            let kept: Vec<(u16, Vec<u8>)> = records
-                .set(i, new, TTL, true)
-                .iter()
-                .map(|r| (r.rtype, r.rdata_wire()))
+    let parts = records
+        .iter()
+        .filter_map(|(id, _)| {
+            // Both sets are built here from the same names, so equal data
+            // (which includes the type) means the same record. Only address
+            // mode gets here (set_addresses returns first in CNAME mode), so
+            // no CNAME targets are compared, and NSEC data compares as sets:
+            // Types are always sorted and without duplicates.
+            let kept: Vec<RData> = records
+                .set(id, new, TTL, true)
+                .into_iter()
+                .map(|r| r.rdata)
                 .collect();
             let answers: Vec<Record> = records
-                .set(i, old, 0, true)
+                .set(id, old, 0, true)
                 .into_iter()
-                .filter(|r| !kept.contains(&(r.rtype, r.rdata_wire())))
+                .filter(|r| !kept.contains(&r.rdata))
                 .collect();
             (!answers.is_empty()).then(|| {
                 (
-                    i,
+                    id,
                     Message {
                         answers,
                         ..Message::default()
@@ -392,7 +430,7 @@ fn retired(records: &Records, old: &[IpAddr], new: &[IpAddr]) -> Vec<Vec<u8>> {
 /// Returns the encoded packets and the aliases whose part alone is too big.
 /// A part is moved into the open message and, if that overflows, split
 /// back out by the section lengths recorded beforehand.
-fn pack(is_response: bool, parts: Vec<(usize, Message)>) -> (Vec<Vec<u8>>, Vec<usize>) {
+fn pack(is_response: bool, parts: Vec<(AliasId, Message)>) -> (Vec<Vec<u8>>, Vec<AliasId>) {
     let mut packets = Vec::new();
     let mut too_big = Vec::new();
     // The open message and its encoding.
@@ -463,6 +501,107 @@ fn fit(mut msg: Message) -> Vec<u8> {
     }
 }
 
+/// Records about our aliases, each with the alias it is about, which keys
+/// the rate limit and the packing of a reply.
+type Tagged = Vec<(AliasId, Record)>;
+
+/// The answers and additional records for `msg`'s questions about our
+/// aliases on an interface with `addrs`, each record once and none in both
+/// sections, and whether every such question asked for a unicast response.
+fn collect(
+    records: &Records,
+    msg: &Message,
+    addrs: &[IpAddr],
+    ttl: u32,
+    cache_flush: bool,
+) -> (Tagged, Tagged, bool) {
+    let mut answers: Tagged = Vec::new();
+    let mut additionals: Tagged = Vec::new();
+    let mut all_unicast = true;
+    for q in &msg.questions {
+        if !matches!(q.qclass, Class::IN | Class::ANY) {
+            continue;
+        }
+        let Some(id) = records.alias_index(&q.name) else {
+            continue;
+        };
+        all_unicast &= q.unicast_response;
+        let (asked, extra) = records.reply(id, addrs, q.qtype, ttl, cache_flush);
+        for rec in asked {
+            if !answers.iter().any(|(_, r)| *r == rec) {
+                answers.push((id, rec));
+            }
+        }
+        for rec in extra {
+            if !additionals.iter().any(|(_, r)| *r == rec) {
+                additionals.push((id, rec));
+            }
+        }
+    }
+    additionals.retain(|(_, r)| !answers.iter().any(|(_, a)| a == r));
+    (answers, additionals, all_unicast)
+}
+
+/// Known-answer suppression (RFC 6762 section 7.1): drops from `records`
+/// what the querier lists in `known` with at least half its TTL left. The
+/// type is part of the data, so equal data means the same type.
+fn suppress_known(records: &mut Tagged, known: &[Record]) {
+    records.retain(|(_, rec)| {
+        !known.iter().any(|k| {
+            k.name == rec.name && k.class == rec.class && k.rdata == rec.rdata && k.ttl >= TTL / 2
+        })
+    });
+}
+
+/// The multicast rate limit (RFC 6762 section 6): drops answers whose
+/// record set (alias, type) was multicast on this link less than
+/// `RATE_LIMIT` ago, unless they defend against a `probe`, and notes the
+/// rest as multicast at `now`.
+fn rate_limit(state: &mut LinkState, answers: &mut Tagged, probe: bool, now: u64) {
+    answers.retain(|&(id, ref r)| {
+        probe
+            || state
+                .last((id, r.rtype()))
+                .is_none_or(|t| now >= t + RATE_LIMIT)
+    });
+    for (id, rec) in answers.iter() {
+        state.set_last((*id, rec.rtype()), now);
+    }
+}
+
+/// A legacy unicast reply (RFC 6762 section 6.7): one packet, echoing the
+/// query's ID and questions.
+fn legacy_reply(msg: &Message, answers: Tagged, additionals: Tagged) -> Vec<u8> {
+    fit(Message {
+        id: msg.id,
+        is_response: true,
+        questions: msg.questions.clone(),
+        answers: answers.into_iter().map(|(_, r)| r).collect(),
+        additionals: additionals.into_iter().map(|(_, r)| r).collect(),
+        ..Message::default()
+    })
+}
+
+/// The packets of an mDNS reply: one part per alias with answers, in alias
+/// order, packed. Additional records for an alias with no answers left are
+/// dropped.
+fn reply_packets(records: &Records, answers: Tagged, additionals: Tagged) -> Vec<Vec<u8>> {
+    let mut parts: Vec<Message> = records.iter().map(|_| Message::default()).collect();
+    for (id, rec) in answers {
+        parts[id.0].answers.push(rec);
+    }
+    for (id, rec) in additionals {
+        parts[id.0].additionals.push(rec);
+    }
+    let parts = records
+        .iter()
+        .zip(parts)
+        .filter(|(_, part)| !part.answers.is_empty())
+        .map(|((id, _), part)| (id, part))
+        .collect();
+    pack(true, parts).0
+}
+
 fn multicast(link: Link, packet: Vec<u8>) -> Outgoing {
     Outgoing {
         link,
@@ -471,7 +610,7 @@ fn multicast(link: Link, packet: Vec<u8>) -> Outgoing {
     }
 }
 
-fn addrs_for(addrs: &[(u32, Vec<IpAddr>)], index: u32) -> &[IpAddr] {
+fn addrs_for(addrs: &[(IfIndex, Vec<IpAddr>)], index: IfIndex) -> &[IpAddr] {
     addrs
         .iter()
         .find(|(i, _)| *i == index)
@@ -482,7 +621,7 @@ pub struct Responder {
     records: Records,
     links: BTreeMap<Link, LinkState>,
     /// Each interface's stable addresses, by index, sorted.
-    addrs: Vec<(u32, Vec<IpAddr>)>,
+    addrs: Vec<(IfIndex, Vec<IpAddr>)>,
     /// Addresses no interface has any more, and when each was removed.
     retired: Vec<(IpAddr, u64)>,
     /// xorshift64 state, for probe start jitter. Never zero.
@@ -490,7 +629,16 @@ pub struct Responder {
 }
 
 impl Responder {
+    /// The aliases must be distinct ignoring case, as `cli::resolve` makes
+    /// them.
     pub fn new(aliases: Vec<Name>, mode: Mode, seed: u64) -> Responder {
+        debug_assert!(
+            aliases
+                .iter()
+                .enumerate()
+                .all(|(i, alias)| !aliases[..i].contains(alias)),
+            "aliases repeat ignoring case"
+        );
         Responder {
             records: Records { aliases, mode },
             links: BTreeMap::new(),
@@ -522,11 +670,18 @@ impl Responder {
     /// Interface `index` now has these stable addresses. Announced links say
     /// goodbye to what is gone and announce the new set twice; waiting links
     /// start probing; a link left with nothing waits again.
-    pub fn set_addresses(&mut self, index: u32, mut addrs: Vec<IpAddr>, now: u64) -> Step {
+    ///
+    /// An empty set, as for an interface that is gone, drops the interface's
+    /// entry: no entry and an empty one mean the same, and interface indexes
+    /// are not reused, so keeping it would grow the list forever.
+    pub fn set_addresses(&mut self, index: IfIndex, mut addrs: Vec<IpAddr>, now: u64) -> Step {
         crate::order::sort(&mut addrs);
         addrs.dedup();
-        let old = match self.addrs.iter_mut().find(|(i, _)| *i == index) {
-            Some((_, list)) => std::mem::replace(list, addrs.clone()),
+        let at = self.addrs.iter().position(|(i, _)| *i == index);
+        let old = match at {
+            Some(at) if addrs.is_empty() => self.addrs.remove(at).1,
+            Some(at) => std::mem::replace(&mut self.addrs[at].1, addrs.clone()),
+            None if addrs.is_empty() => Vec::new(),
             None => {
                 self.addrs.push((index, addrs.clone()));
                 Vec::new()
@@ -547,7 +702,6 @@ impl Responder {
             return step;
         }
         let due = now + self.random(PROBE_WAIT_MAX + 1);
-        let aliases = self.records.aliases.len();
         for (&link, state) in self.links.iter_mut().filter(|(l, _)| l.index == index) {
             match state.phase {
                 Phase::Waiting if !addrs.is_empty() => {
@@ -565,7 +719,7 @@ impl Responder {
                     let (msgs, _) = build(&self.records, &addrs, Kind::Announce { ttl: TTL });
                     step.sends
                         .extend(msgs.into_iter().map(|p| multicast(link, p)));
-                    state.mark_all(aliases, now);
+                    state.mark_all(&self.records, now);
                     state.phase = Phase::Announcing {
                         due: now + ANNOUNCE_INTERVAL,
                     };
@@ -579,7 +733,6 @@ impl Responder {
     /// Sends whatever probe or announcement has come due.
     pub fn poll(&mut self, now: u64) -> Step {
         let mut step = Step::default();
-        let aliases = self.records.aliases.len();
         for (&link, state) in &mut self.links {
             let kind = match state.phase {
                 Phase::Probing { sent, due } if now >= due && sent < PROBES => {
@@ -595,22 +748,22 @@ impl Responder {
                     state.phase = Phase::Announcing {
                         due: now + ANNOUNCE_INTERVAL,
                     };
-                    state.mark_all(aliases, now);
+                    state.mark_all(&self.records, now);
                     Kind::Announce { ttl: TTL }
                 }
                 Phase::Announcing { due } if now >= due => {
                     state.phase = Phase::Announced;
-                    state.mark_all(aliases, now);
+                    state.mark_all(&self.records, now);
                     step.notices.push(Notice::Announced(link));
                     Kind::Announce { ttl: TTL }
                 }
                 _ => continue,
             };
             let (msgs, too_big) = build(&self.records, addrs_for(&self.addrs, link.index), kind);
-            for i in too_big {
-                if !state.oversized.contains(&i) {
-                    state.oversized.push(i);
-                    let alias = self.records.aliases[i].clone();
+            for id in too_big {
+                if !state.oversized.contains(&id) {
+                    state.oversized.push(id);
+                    let alias = self.records.name(id).clone();
                     step.notices.push(Notice::Oversized(link, alias));
                 }
             }
@@ -682,12 +835,12 @@ impl Responder {
             if rec.ttl == 0 {
                 continue;
             }
-            let Some(i) = self.records.alias_index(&rec.name) else {
+            let Some(id) = self.records.alias_index(&rec.name) else {
                 continue;
             };
             if self.records.contradicts(rec, &ours) {
                 return Err(Conflict {
-                    alias: self.records.aliases[i].clone(),
+                    alias: self.records.name(id).clone(),
                     source: source.ip(),
                 });
             }
@@ -712,7 +865,7 @@ impl Responder {
             return;
         }
         let addrs = addrs_for(&self.addrs, link.index);
-        for (i, alias) in self.records.aliases.iter().enumerate() {
+        for (id, alias) in self.records.iter() {
             let mut theirs: Vec<_> = msg
                 .authorities
                 .iter()
@@ -734,7 +887,7 @@ impl Responder {
             crate::order::heapsort(&mut theirs);
             let mut ours: Vec<_> = self
                 .records
-                .set(i, addrs, TTL, false)
+                .set(id, addrs, TTL, false)
                 .iter()
                 .map(canonical)
                 .collect();
@@ -750,6 +903,8 @@ impl Responder {
         }
     }
 
+    /// Answers a query about our aliases: collect the records, drop those
+    /// the querier knows, rate-limit multicasts, and pack what is left.
     fn answer(&mut self, msg: &Message, link: Link, source: SocketAddr, now: u64, step: &mut Step) {
         let Some(state) = self.links.get_mut(&link) else {
             return;
@@ -758,110 +913,40 @@ impl Responder {
         if !matches!(state.phase, Phase::Announcing { .. } | Phase::Announced) {
             return;
         }
-        let records = &self.records;
         let addrs = addrs_for(&self.addrs, link.index);
         let legacy = source.port() != MDNS_PORT;
+        // Legacy replies get short TTLs and no cache-flush bit (RFC 6762
+        // section 6.7).
         let (ttl, cache_flush) = if legacy {
             (LEGACY_TTL, false)
         } else {
             (TTL, true)
         };
-        let mut answers: Vec<Record> = Vec::new();
-        let mut additionals: Vec<Record> = Vec::new();
-        let mut all_unicast = true;
-        for q in &msg.questions {
-            if !matches!(q.qclass, CLASS_IN | CLASS_ANY) {
-                continue;
-            }
-            let Some(i) = records.alias_index(&q.name) else {
-                continue;
-            };
-            all_unicast &= q.unicast_response;
-            let (asked, extra) = records.reply(i, addrs, q.qtype, ttl, cache_flush);
-            for rec in asked {
-                if !answers.contains(&rec) {
-                    answers.push(rec);
-                }
-            }
-            for rec in extra {
-                if !additionals.contains(&rec) {
-                    additionals.push(rec);
-                }
-            }
-        }
-        additionals.retain(|r| !answers.contains(r));
-        // Known-answer suppression (RFC 6762 section 7.1): skip what the
-        // querier holds with at least half its TTL left.
-        let known = |rec: &Record| {
-            msg.answers.iter().any(|k| {
-                k.name == rec.name
-                    && k.rtype == rec.rtype
-                    && k.class == rec.class
-                    && k.rdata == rec.rdata
-                    && k.ttl >= TTL / 2
-            })
-        };
-        answers.retain(|r| !known(r));
-        additionals.retain(|r| !known(r));
+        let (mut answers, mut additionals, all_unicast) =
+            collect(&self.records, msg, addrs, ttl, cache_flush);
+        suppress_known(&mut answers, &msg.answers);
+        suppress_known(&mut additionals, &msg.answers);
         if answers.is_empty() {
             return;
         }
-        let key = |rec: &Record| {
-            (
-                records.alias_index(&rec.name).unwrap_or(usize::MAX),
-                rec.rtype,
-            )
-        };
         if !legacy && !all_unicast {
             // A probe must be answered at once, so it is exempt.
             let probe = !msg.authorities.is_empty();
-            answers.retain(|r| probe || state.last(key(r)).is_none_or(|t| now >= t + RATE_LIMIT));
+            rate_limit(state, &mut answers, probe, now);
             if answers.is_empty() {
                 return;
             }
-            for rec in &answers {
-                state.set_last(key(rec), now);
-            }
         }
-        let dest = if legacy || all_unicast {
-            Dest::Unicast(source)
+        let (dest, packets) = if legacy {
+            let packet = legacy_reply(msg, answers, additionals);
+            (Dest::Unicast(source), vec![packet])
         } else {
-            Dest::Multicast
-        };
-        let packets = if legacy {
-            // Legacy unicast (RFC 6762 section 6.7): one packet, echoing the
-            // ID and questions, short TTLs and no cache-flush bit.
-            vec![fit(Message {
-                id: msg.id,
-                is_response: true,
-                questions: msg.questions.clone(),
-                answers,
-                additionals,
-                ..Message::default()
-            })]
-        } else {
-            let parts = records
-                .aliases
-                .iter()
-                .enumerate()
-                .filter_map(|(i, alias)| {
-                    let part = Message {
-                        answers: answers
-                            .iter()
-                            .filter(|r| r.name == *alias)
-                            .cloned()
-                            .collect(),
-                        additionals: additionals
-                            .iter()
-                            .filter(|r| r.name == *alias)
-                            .cloned()
-                            .collect(),
-                        ..Message::default()
-                    };
-                    (!part.answers.is_empty()).then_some((i, part))
-                })
-                .collect();
-            pack(true, parts).0
+            let dest = if all_unicast {
+                Dest::Unicast(source)
+            } else {
+                Dest::Multicast
+            };
+            (dest, reply_packets(&self.records, answers, additionals))
         };
         for packet in packets {
             step.sends.push(Outgoing { link, dest, packet });
@@ -895,8 +980,8 @@ impl Responder {
 
 /// A record as RFC 6762 section 8.2 compares them: class, then type, then
 /// rdata as uncompressed bytes.
-fn canonical(rec: &Record) -> (u16, u16, Vec<u8>) {
-    (rec.class, rec.rtype, rec.rdata_wire())
+fn canonical(rec: &Record) -> (Class, RType, Vec<u8>) {
+    (rec.class, rec.rtype(), rec.rdata_wire())
 }
 
 #[cfg(test)]
@@ -906,7 +991,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     const V4: Link = Link {
-        index: 2,
+        index: IfIndex::of(2),
         family: Family::V4,
     };
     const ALIAS: &str = "app.myhost.local";
@@ -927,8 +1012,7 @@ mod tests {
     fn cname(ttl: u32, cache_flush: bool) -> Record {
         Record {
             name: name(ALIAS),
-            rtype: TYPE_CNAME,
-            class: CLASS_IN,
+            class: Class::IN,
             cache_flush,
             ttl,
             rdata: RData::Cname(name(TARGET)),
@@ -998,8 +1082,8 @@ mod tests {
                     msg.questions,
                     [Question {
                         name: name(ALIAS),
-                        qtype: TYPE_ANY,
-                        qclass: CLASS_IN,
+                        qtype: RType::ANY,
+                        qclass: Class::IN,
                         unicast_response: i == 0
                     }]
                 );
@@ -1028,7 +1112,7 @@ mod tests {
     #[test]
     fn links_progress_independently() {
         let v6 = Link {
-            index: 2,
+            index: IfIndex::of(2),
             family: Family::V6,
         };
         let mut r = responder();
@@ -1063,7 +1147,7 @@ mod tests {
     const CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 5353);
     const LEGACY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 54928);
 
-    fn query(questions: &[(&str, u16, bool)]) -> Message {
+    fn query(questions: &[(&str, RType, bool)]) -> Message {
         Message {
             id: 0x4242,
             questions: questions
@@ -1071,7 +1155,7 @@ mod tests {
                 .map(|&(n, qtype, qu)| Question {
                     name: name(n),
                     qtype,
-                    qclass: CLASS_IN,
+                    qclass: Class::IN,
                     unicast_response: qu,
                 })
                 .collect(),
@@ -1091,10 +1175,10 @@ mod tests {
 
     #[test]
     fn answers_address_cname_and_any_questions_with_the_cname() {
-        for qtype in [TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_ANY] {
+        for qtype in [RType::A, RType::AAAA, RType::CNAME, RType::ANY] {
             let mut r = announced_responder();
             let sent = ask(&mut r, &query(&[(ALIAS, qtype, false)]), CLIENT, 10_000);
-            assert_eq!(sent.len(), 1, "qtype {qtype}");
+            assert_eq!(sent.len(), 1, "qtype {qtype:?}");
             assert_eq!((sent[0].link, sent[0].dest), (V4, Dest::Multicast));
             let msg = decode(&sent[0]);
             assert!(msg.is_response);
@@ -1107,17 +1191,17 @@ mod tests {
     #[test]
     fn ignores_other_types_and_names() {
         let mut r = announced_responder();
-        assert!(ask(&mut r, &query(&[(ALIAS, 16, false)]), CLIENT, 10_000).is_empty());
+        assert!(ask(&mut r, &query(&[(ALIAS, RType(16), false)]), CLIENT, 10_000).is_empty());
         assert!(
             ask(
                 &mut r,
-                &query(&[("other.local", TYPE_A, false)]),
+                &query(&[("other.local", RType::A, false)]),
                 CLIENT,
                 10_000
             )
             .is_empty()
         );
-        assert!(ask(&mut r, &query(&[(TARGET, TYPE_A, false)]), CLIENT, 10_000).is_empty());
+        assert!(ask(&mut r, &query(&[(TARGET, RType::A, false)]), CLIENT, 10_000).is_empty());
     }
 
     #[test]
@@ -1125,7 +1209,7 @@ mod tests {
         let mut r = announced_responder();
         let sent = ask(
             &mut r,
-            &query(&[("APP.MYHOST.LOCAL", TYPE_A, false)]),
+            &query(&[("APP.MYHOST.LOCAL", RType::A, false)]),
             CLIENT,
             10_000,
         );
@@ -1137,18 +1221,18 @@ mod tests {
         let mut r = responder();
         r.add_link(V4, 0);
         run(&mut r, 0, 600);
-        assert!(ask(&mut r, &query(&[(ALIAS, TYPE_A, false)]), CLIENT, 600).is_empty());
+        assert!(ask(&mut r, &query(&[(ALIAS, RType::A, false)]), CLIENT, 600).is_empty());
     }
 
     #[test]
     fn ignores_links_it_does_not_serve() {
         let mut r = announced_responder();
         let other = Link {
-            index: 9,
+            index: IfIndex::of(9),
             family: Family::V4,
         };
         let step = r.handle(
-            &wire::encode(&query(&[(ALIAS, TYPE_A, false)])),
+            &wire::encode(&query(&[(ALIAS, RType::A, false)])),
             other,
             CLIENT,
             10_000,
@@ -1172,7 +1256,7 @@ mod tests {
         let mut r = announced_responder();
         let sent = ask(
             &mut r,
-            &query(&[(ALIAS, TYPE_A, false), (ALIAS, TYPE_AAAA, false)]),
+            &query(&[(ALIAS, RType::A, false), (ALIAS, RType::AAAA, false)]),
             CLIENT,
             10_000,
         );
@@ -1183,16 +1267,16 @@ mod tests {
     #[test]
     fn unicast_response_questions_get_a_unicast_reply() {
         let mut r = announced_responder();
-        let sent = ask(&mut r, &query(&[(ALIAS, TYPE_A, true)]), CLIENT, 10_000);
+        let sent = ask(&mut r, &query(&[(ALIAS, RType::A, true)]), CLIENT, 10_000);
         assert_eq!(sent[0].dest, Dest::Unicast(CLIENT));
-        let mixed = query(&[(ALIAS, TYPE_A, true), (ALIAS, TYPE_AAAA, false)]);
+        let mixed = query(&[(ALIAS, RType::A, true), (ALIAS, RType::AAAA, false)]);
         assert_eq!(ask(&mut r, &mixed, CLIENT, 20_000)[0].dest, Dest::Multicast);
     }
 
     #[test]
     fn legacy_queries_get_a_short_lived_unicast_echo() {
         let mut r = announced_responder();
-        let q = query(&[(ALIAS, TYPE_A, false)]);
+        let q = query(&[(ALIAS, RType::A, false)]);
         let sent = ask(&mut r, &q, LEGACY, 10_000);
         assert_eq!(sent[0].dest, Dest::Unicast(LEGACY));
         let msg = decode(&sent[0]);
@@ -1204,7 +1288,7 @@ mod tests {
     #[test]
     fn suppresses_answers_the_querier_already_knows() {
         let mut r = announced_responder();
-        let mut q = query(&[(ALIAS, TYPE_A, false)]);
+        let mut q = query(&[(ALIAS, RType::A, false)]);
         q.answers = vec![cname(TTL, false)];
         assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
         q.answers = vec![cname(TTL / 2 - 1, false)];
@@ -1214,7 +1298,7 @@ mod tests {
     #[test]
     fn multicasts_each_record_at_most_once_a_second() {
         let mut r = announced_responder();
-        let q = query(&[(ALIAS, TYPE_A, false)]);
+        let q = query(&[(ALIAS, RType::A, false)]);
         assert_eq!(ask(&mut r, &q, CLIENT, 3000).len(), 1);
         assert!(ask(&mut r, &q, CLIENT, 3500).is_empty());
         assert_eq!(ask(&mut r, &q, CLIENT, 4000).len(), 1);
@@ -1224,10 +1308,10 @@ mod tests {
     fn defends_against_probes_despite_the_rate_limit() {
         let mut r = announced_responder();
         assert_eq!(
-            ask(&mut r, &query(&[(ALIAS, TYPE_A, false)]), CLIENT, 3000).len(),
+            ask(&mut r, &query(&[(ALIAS, RType::A, false)]), CLIENT, 3000).len(),
             1
         );
-        let mut probe = query(&[(ALIAS, TYPE_ANY, false)]);
+        let mut probe = query(&[(ALIAS, RType::ANY, false)]);
         let mut theirs = cname(TTL, false);
         theirs.rdata = RData::Cname(name("elsewhere.local"));
         probe.authorities = vec![theirs];
@@ -1239,8 +1323,7 @@ mod tests {
     fn a_record(owner: &str, ttl: u32) -> Record {
         Record {
             name: name(owner),
-            rtype: TYPE_A,
-            class: CLASS_IN,
+            class: Class::IN,
             cache_flush: true,
             ttl,
             rdata: RData::A(Ipv4Addr::new(192, 0, 2, 1)),
@@ -1260,7 +1343,7 @@ mod tests {
     }
 
     fn their_probe(target: &str) -> Message {
-        let mut probe = query(&[(ALIAS, TYPE_ANY, true)]);
+        let mut probe = query(&[(ALIAS, RType::ANY, true)]);
         probe.authorities = vec![Record {
             rdata: RData::Cname(name(target)),
             ..cname(TTL, false)
@@ -1363,7 +1446,7 @@ mod tests {
     fn ignores_responses_on_links_it_does_not_serve() {
         let mut r = announced_responder();
         let other = Link {
-            index: 9,
+            index: IfIndex::of(9),
             family: Family::V4,
         };
         let packet = wire::encode(&response(vec![a_record(ALIAS, 120)]));
@@ -1409,7 +1492,7 @@ mod tests {
     }
 
     const V4B: Link = Link {
-        index: 3,
+        index: IfIndex::of(3),
         family: Family::V4,
     };
 
@@ -1423,8 +1506,7 @@ mod tests {
         };
         Record {
             name: name(ALIAS),
-            rtype: TYPE_A,
-            class: CLASS_IN,
+            class: Class::IN,
             cache_flush,
             ttl,
             rdata: RData::A(v4),
@@ -1437,24 +1519,22 @@ mod tests {
         };
         Record {
             name: name(ALIAS),
-            rtype: TYPE_AAAA,
-            class: CLASS_IN,
+            class: Class::IN,
             cache_flush,
             ttl,
             rdata: RData::Aaaa(v6),
         }
     }
 
-    fn nsec(types: &[u16], ttl: u32, cache_flush: bool) -> Record {
+    fn nsec(types: &[RType], ttl: u32, cache_flush: bool) -> Record {
         Record {
             name: name(ALIAS),
-            rtype: TYPE_NSEC,
-            class: CLASS_IN,
+            class: Class::IN,
             cache_flush,
             ttl,
             rdata: RData::Nsec {
                 next: name(ALIAS),
-                types: types.to_vec(),
+                types: types.iter().copied().collect(),
             },
         }
     }
@@ -1462,7 +1542,7 @@ mod tests {
     /// An address-mode responder whose interface 2 has `addrs`.
     fn with_addresses(addrs: &[&str]) -> Responder {
         let mut r = Responder::new(vec![name(ALIAS)], Mode::Addresses, 7);
-        r.set_addresses(2, addrs.iter().map(|a| ip(a)).collect(), 0);
+        r.set_addresses(IfIndex::of(2), addrs.iter().map(|a| ip(a)).collect(), 0);
         r
     }
 
@@ -1482,7 +1562,7 @@ mod tests {
         let mut r = Responder::new(vec![name(ALIAS)], Mode::Addresses, 7);
         r.add_link(V4, 0);
         assert!(run(&mut r, 0, 3000).0.is_empty());
-        let step = r.set_addresses(2, vec![ip("192.0.2.10")], 3000);
+        let step = r.set_addresses(IfIndex::of(2), vec![ip("192.0.2.10")], 3000);
         assert!(step.sends.is_empty());
         assert_eq!(run(&mut r, 3000, 6000).0.len(), 5);
     }
@@ -1511,7 +1591,7 @@ mod tests {
         let (sent, _) = run(&mut r, 0, 3000);
         assert_eq!(
             decode(&sent[3].1).answers,
-            [a("192.0.2.10", TTL, true), nsec(&[TYPE_A], TTL, true)]
+            [a("192.0.2.10", TTL, true), nsec(&[RType::A], TTL, true)]
         );
     }
 
@@ -1520,10 +1600,63 @@ mod tests {
         let mut r = announced_with(&["192.0.2.10", "2001:db8::10"]);
         let msg = one(ask(
             &mut r,
-            &query(&[(ALIAS, TYPE_A, false)]),
+            &query(&[(ALIAS, RType::A, false)]),
             CLIENT,
             10_000,
         ));
+        assert_eq!(msg.answers, [a("192.0.2.10", TTL, true)]);
+        assert_eq!(msg.additionals, [aaaa("2001:db8::10", TTL, true)]);
+    }
+
+    #[test]
+    fn a_question_asked_twice_gets_its_additional_record_once() {
+        let mut r = announced_with(&["192.0.2.10", "2001:db8::10"]);
+        let twice = query(&[(ALIAS, RType::A, false), (ALIAS, RType::A, false)]);
+        let msg = one(ask(&mut r, &twice, CLIENT, 10_000));
+        assert_eq!(msg.answers, [a("192.0.2.10", TTL, true)]);
+        assert_eq!(msg.additionals, [aaaa("2001:db8::10", TTL, true)]);
+    }
+
+    #[test]
+    fn several_aliases_are_rate_limited_and_packed_each_on_its_own() {
+        const WEB: &str = "web.myhost.local";
+        let mut r = Responder::new(vec![name(ALIAS), name(WEB)], Mode::Addresses, 7);
+        r.set_addresses(
+            IfIndex::of(2),
+            ["192.0.2.10", "2001:db8::10"].map(ip).to_vec(),
+            0,
+        );
+        announced(&mut r, V4);
+        let web = |rec: Record| Record {
+            name: name(WEB),
+            ..rec
+        };
+        let both = query(&[(WEB, RType::A, false), (ALIAS, RType::A, false)]);
+        // Answers and their additional records come in alias order, whatever
+        // the order of the questions.
+        let msg = one(ask(&mut r, &both, CLIENT, 3000));
+        assert_eq!(
+            msg.answers,
+            [a("192.0.2.10", TTL, true), web(a("192.0.2.10", TTL, true))]
+        );
+        assert_eq!(
+            msg.additionals,
+            [
+                aaaa("2001:db8::10", TTL, true),
+                web(aaaa("2001:db8::10", TTL, true))
+            ]
+        );
+        // The rate limit is per alias: answering one leaves the other free.
+        let msg = one(ask(&mut r, &query(&[(WEB, RType::A, false)]), CLIENT, 4000));
+        assert_eq!(msg.answers, [web(a("192.0.2.10", TTL, true))]);
+        let msg = one(ask(&mut r, &both, CLIENT, 4500));
+        assert_eq!(msg.answers, [a("192.0.2.10", TTL, true)]);
+        assert_eq!(msg.additionals, [aaaa("2001:db8::10", TTL, true)]);
+        // An alias whose answers the querier already knows sends no
+        // additional records either.
+        let mut known = both.clone();
+        known.answers = vec![web(a("192.0.2.10", TTL, false))];
+        let msg = one(ask(&mut r, &known, CLIENT, 6000));
         assert_eq!(msg.answers, [a("192.0.2.10", TTL, true)]);
         assert_eq!(msg.additionals, [aaaa("2001:db8::10", TTL, true)]);
     }
@@ -1533,15 +1666,20 @@ mod tests {
         let mut r = announced_with(&["192.0.2.10"]);
         let msg = one(ask(
             &mut r,
-            &query(&[(ALIAS, TYPE_AAAA, false)]),
+            &query(&[(ALIAS, RType::AAAA, false)]),
             CLIENT,
             10_000,
         ));
-        assert_eq!(msg.answers, [nsec(&[TYPE_A], TTL, true)]);
+        assert_eq!(msg.answers, [nsec(&[RType::A], TTL, true)]);
         assert_eq!(msg.additionals, [a("192.0.2.10", TTL, true)]);
         let mut r = announced_with(&["192.0.2.10", "2001:db8::10"]);
-        let msg = one(ask(&mut r, &query(&[(ALIAS, 16, false)]), CLIENT, 10_000));
-        assert_eq!(msg.answers, [nsec(&[TYPE_A, TYPE_AAAA], TTL, true)]);
+        let msg = one(ask(
+            &mut r,
+            &query(&[(ALIAS, RType(16), false)]),
+            CLIENT,
+            10_000,
+        ));
+        assert_eq!(msg.answers, [nsec(&[RType::A, RType::AAAA], TTL, true)]);
         assert!(msg.additionals.is_empty());
     }
 
@@ -1550,26 +1688,26 @@ mod tests {
         let mut r = announced_with(&["192.0.2.10"]);
         let msg = one(ask(
             &mut r,
-            &query(&[(ALIAS, TYPE_ANY, false)]),
+            &query(&[(ALIAS, RType::ANY, false)]),
             CLIENT,
             10_000,
         ));
         assert_eq!(
             msg.answers,
-            [a("192.0.2.10", TTL, true), nsec(&[TYPE_A], TTL, true)]
+            [a("192.0.2.10", TTL, true), nsec(&[RType::A], TTL, true)]
         );
     }
 
     #[test]
     fn answers_with_the_arrival_interfaces_addresses() {
         let mut r = with_addresses(&["192.0.2.10"]);
-        r.set_addresses(3, vec![ip("198.51.100.10")], 0);
+        r.set_addresses(IfIndex::of(3), vec![ip("198.51.100.10")], 0);
         announced(&mut r, V4);
         r.add_link(V4B, 2000);
         run(&mut r, 2000, 5000);
         let sent = r
             .handle(
-                &wire::encode(&query(&[(ALIAS, TYPE_A, false)])),
+                &wire::encode(&query(&[(ALIAS, RType::A, false)])),
                 V4B,
                 CLIENT,
                 10_000,
@@ -1582,13 +1720,13 @@ mod tests {
     #[test]
     fn an_address_change_says_goodbye_and_announces_twice() {
         let mut r = announced_with(&["192.0.2.10"]);
-        let step = r.set_addresses(2, vec![ip("192.0.2.11")], 5000);
+        let step = r.set_addresses(IfIndex::of(2), vec![ip("192.0.2.11")], 5000);
         assert_eq!(step.sends.len(), 2);
         let packets: Vec<Message> = step.sends.iter().map(decode).collect();
         assert_eq!(packets[0].answers, [a("192.0.2.10", 0, true)]);
         assert_eq!(
             packets[1].answers,
-            [a("192.0.2.11", TTL, true), nsec(&[TYPE_A], TTL, true)]
+            [a("192.0.2.11", TTL, true), nsec(&[RType::A], TTL, true)]
         );
         let (sent, notices) = run(&mut r, 5001, 7000);
         assert_eq!(sent.len(), 1);
@@ -1599,10 +1737,14 @@ mod tests {
     #[test]
     fn a_family_appearing_withdraws_the_nsec() {
         let mut r = announced_with(&["192.0.2.10"]);
-        let step = r.set_addresses(2, vec![ip("192.0.2.10"), ip("2001:db8::10")], 5000);
+        let step = r.set_addresses(
+            IfIndex::of(2),
+            vec![ip("192.0.2.10"), ip("2001:db8::10")],
+            5000,
+        );
         let packets: Vec<Message> = step.sends.iter().map(decode).collect();
         assert_eq!(packets.len(), 2);
-        assert_eq!(packets[0].answers, [nsec(&[TYPE_A], 0, true)]);
+        assert_eq!(packets[0].answers, [nsec(&[RType::A], 0, true)]);
         assert_eq!(
             packets[1].answers,
             [a("192.0.2.10", TTL, true), aaaa("2001:db8::10", TTL, true)]
@@ -1620,7 +1762,7 @@ mod tests {
             decode(&sent[0].1).authorities[0],
             a("192.0.2.10", TTL, false)
         );
-        let step = r.set_addresses(2, vec![ip("192.0.2.11")], 150);
+        let step = r.set_addresses(IfIndex::of(2), vec![ip("192.0.2.11")], 150);
         assert!(step.sends.is_empty(), "no goodbye while probing");
         let (sent, notices) = run(&mut r, 151, 5000);
         let packets: Vec<Message> = sent.iter().map(|(_, o)| decode(o)).collect();
@@ -1636,7 +1778,7 @@ mod tests {
         for msg in announcements {
             assert_eq!(
                 msg.answers,
-                [a("192.0.2.11", TTL, true), nsec(&[TYPE_A], TTL, true)]
+                [a("192.0.2.11", TTL, true), nsec(&[RType::A], TTL, true)]
             );
         }
         assert_eq!(notices, [Notice::Announced(V4)]);
@@ -1645,14 +1787,14 @@ mod tests {
     #[test]
     fn losing_every_address_says_goodbye_and_waits() {
         let mut r = announced_with(&["192.0.2.10"]);
-        let step = r.set_addresses(2, Vec::new(), 5000);
+        let step = r.set_addresses(IfIndex::of(2), Vec::new(), 5000);
         let packets: Vec<Message> = step.sends.iter().map(decode).collect();
         assert_eq!(packets.len(), 1);
         assert_eq!(
             packets[0].answers,
-            [a("192.0.2.10", 0, true), nsec(&[TYPE_A], 0, true)]
+            [a("192.0.2.10", 0, true), nsec(&[RType::A], 0, true)]
         );
-        assert!(ask(&mut r, &query(&[(ALIAS, TYPE_A, false)]), CLIENT, 10_000).is_empty());
+        assert!(ask(&mut r, &query(&[(ALIAS, RType::A, false)]), CLIENT, 10_000).is_empty());
         assert!(run(&mut r, 5001, 9000).0.is_empty());
     }
 
@@ -1661,14 +1803,14 @@ mod tests {
         let mut r = with_addresses(&["192.0.2.10"]);
         r.add_link(V4, 0);
         run(&mut r, 0, 260);
-        r.set_addresses(2, Vec::new(), 300);
+        r.set_addresses(IfIndex::of(2), Vec::new(), 300);
         assert!(run(&mut r, 301, 5000).0.is_empty());
     }
 
     #[test]
     fn our_own_addresses_on_any_interface_are_not_conflicts() {
         let mut r = with_addresses(&["192.0.2.10"]);
-        r.set_addresses(3, vec![ip("198.51.100.10")], 0);
+        r.set_addresses(IfIndex::of(3), vec![ip("198.51.100.10")], 0);
         announced(&mut r, V4);
         let other_interface = response(vec![a("198.51.100.10", TTL, true)]);
         assert!(hear(&mut r, &other_interface, 5000).is_ok());
@@ -1679,11 +1821,10 @@ mod tests {
         for rec in [
             a("192.0.2.99", TTL, true),
             Record {
-                rtype: TYPE_CNAME,
                 rdata: RData::Cname(name("elsewhere.local")),
                 ..a("192.0.2.10", TTL, true)
             },
-            nsec(&[16], TTL, true),
+            nsec(&[RType(16)], TTL, true),
         ] {
             let mut r = announced_with(&["192.0.2.10"]);
             assert!(
@@ -1697,17 +1838,36 @@ mod tests {
     fn a_just_removed_address_is_not_a_conflict_for_a_while() {
         let looped = response(vec![a("192.0.2.10", TTL, true)]);
         let mut r = announced_with(&["192.0.2.10"]);
-        r.set_addresses(2, vec![ip("192.0.2.11")], 5000);
+        r.set_addresses(IfIndex::of(2), vec![ip("192.0.2.11")], 5000);
         assert!(hear(&mut r, &looped, 5100).is_ok());
         let mut r = announced_with(&["192.0.2.10"]);
-        r.set_addresses(2, vec![ip("192.0.2.11")], 5000);
+        r.set_addresses(IfIndex::of(2), vec![ip("192.0.2.11")], 5000);
+        assert!(hear(&mut r, &looped, 5000 + RETIRED_GRACE + 1).is_err());
+    }
+
+    #[test]
+    fn an_interface_left_with_no_addresses_is_forgotten() {
+        let mut r = announced_with(&["192.0.2.10"]);
+        r.set_addresses(IfIndex::of(3), vec![ip("198.51.100.10")], 0);
+        r.set_addresses(IfIndex::of(2), Vec::new(), 5000);
+        assert_eq!(r.addrs, [(IfIndex::of(3), vec![ip("198.51.100.10")])]);
+        // Departed interfaces leave nothing behind, however many come and go.
+        for index in (10..20).map(IfIndex::of) {
+            r.set_addresses(index, vec![ip("203.0.113.10")], 5000);
+            r.set_addresses(index, Vec::new(), 5000);
+        }
+        r.set_addresses(IfIndex::of(30), Vec::new(), 5000);
+        assert_eq!(r.addrs.len(), 1);
+        // Its addresses still count as ours for the retired window.
+        let looped = response(vec![a("192.0.2.10", TTL, true)]);
+        assert!(hear(&mut r, &looped, 5100).is_ok());
         assert!(hear(&mut r, &looped, 5000 + RETIRED_GRACE + 1).is_err());
     }
 
     #[test]
     fn own_nsec_is_not_a_conflict() {
         let mut r = announced_with(&["192.0.2.10"]);
-        assert!(hear(&mut r, &response(vec![nsec(&[TYPE_A], TTL, true)]), 5000).is_ok());
+        assert!(hear(&mut r, &response(vec![nsec(&[RType::A], TTL, true)]), 5000).is_ok());
         let own = announcement(&r, V4);
         assert!(hear(&mut r, &own, 5000).is_ok());
     }
@@ -1716,17 +1876,57 @@ mod tests {
     fn other_types_for_an_alias_are_not_conflicts() {
         let mut r = announced_with(&["192.0.2.10"]);
         let txt = Record {
-            rtype: 16,
-            rdata: RData::Other(vec![1, b'x']),
+            rdata: RData::Other {
+                rtype: RType(16),
+                bytes: vec![1, b'x'],
+            },
             ..a("192.0.2.10", TTL, true)
         };
         assert!(hear(&mut r, &response(vec![txt]), 5000).is_ok());
     }
 
     #[test]
+    fn an_address_record_of_the_wrong_length_is_a_conflict() {
+        let mut r = announced_with(&["192.0.2.10"]);
+        let short = Record {
+            rdata: RData::Other {
+                rtype: RType::A,
+                bytes: vec![192, 0, 2],
+            },
+            ..a("192.0.2.10", TTL, true)
+        };
+        let msg = response(vec![short]);
+        let parsed = wire::parse(&wire::encode(&msg)).unwrap();
+        assert!(matches!(
+            parsed.answers[0].rdata,
+            RData::Other {
+                rtype: RType::A,
+                ..
+            }
+        ));
+        assert!(hear(&mut r, &msg, 5000).is_err());
+    }
+
+    #[test]
+    fn canonical_orders_by_class_then_type_then_rdata() {
+        // A lower class wins over a lower type, and a lower type over
+        // lower rdata bytes.
+        let aaaa_in = aaaa("2001:db8::1", TTL, false);
+        let a_chaos = Record {
+            class: Class(3),
+            ..a("192.0.2.1", TTL, false)
+        };
+        assert!(canonical(&aaaa_in) < canonical(&a_chaos));
+        let a_high = a("192.0.2.200", TTL, false);
+        let aaaa_low = aaaa("::1", TTL, false);
+        assert!(canonical(&a_high) < canonical(&aaaa_low));
+        assert!(canonical(&a("192.0.2.1", TTL, false)) < canonical(&a_high));
+    }
+
+    #[test]
     fn tiebreaks_compare_address_sets() {
         let probe_from = |addr: &str| {
-            let mut p = query(&[(ALIAS, TYPE_ANY, true)]);
+            let mut p = query(&[(ALIAS, RType::ANY, true)]);
             p.authorities = vec![a(addr, TTL, false)];
             p
         };
@@ -1755,11 +1955,14 @@ mod tests {
     #[test]
     fn this_hosts_own_probes_on_another_interface_do_not_tiebreak() {
         let mut r = with_addresses(&["192.0.2.10"]);
-        r.set_addresses(3, vec![ip("198.51.100.10")], 0);
+        r.set_addresses(IfIndex::of(3), vec![ip("198.51.100.10")], 0);
         r.add_link(V4, 0);
         run(&mut r, 0, 250);
-        let mut p = query(&[(ALIAS, TYPE_ANY, true)]);
-        p.authorities = vec![a("198.51.100.10", TTL, false), nsec(&[TYPE_A], TTL, false)];
+        let mut p = query(&[(ALIAS, RType::ANY, true)]);
+        p.authorities = vec![
+            a("198.51.100.10", TTL, false),
+            nsec(&[RType::A], TTL, false),
+        ];
         let step = hear(&mut r, &p, 251).unwrap();
         assert!(step.notices.is_empty(), "{:?}", step.notices);
         // A foreign address among the records still counts as a rival.
@@ -1779,7 +1982,7 @@ mod tests {
         let addrs = ["192.0.2.10", "2001:db8::10", "fd00::10", "fe80::10"]
             .map(ip)
             .to_vec();
-        r.set_addresses(2, addrs, 0);
+        r.set_addresses(IfIndex::of(2), addrs, 0);
         r.add_link(V4, 0);
         let (sent, _) = run(&mut r, 0, 3000);
         let announcements: Vec<&Outgoing> = sent
@@ -1828,7 +2031,7 @@ mod tests {
             .collect();
         let mut r = Responder::new(aliases.clone(), Mode::Addresses, 7);
         r.set_addresses(
-            2,
+            IfIndex::of(2),
             ["192.0.2.10", "2001:db8::10", "fd00::10"].map(ip).to_vec(),
             0,
         );
@@ -1838,11 +2041,11 @@ mod tests {
             ..Message::default()
         };
         for alias in &aliases {
-            for qtype in [TYPE_A, TYPE_AAAA] {
+            for qtype in [RType::A, RType::AAAA] {
                 q.questions.push(Question {
                     name: alias.clone(),
                     qtype,
-                    qclass: CLASS_IN,
+                    qclass: Class::IN,
                     unicast_response: false,
                 });
             }
@@ -1868,7 +2071,7 @@ mod tests {
             .collect();
         let mut r = Responder::new(aliases.clone(), Mode::Addresses, 7);
         r.set_addresses(
-            2,
+            IfIndex::of(2),
             ["192.0.2.10", "2001:db8::10", "fd00::10"].map(ip).to_vec(),
             0,
         );
@@ -1880,8 +2083,8 @@ mod tests {
         for alias in &aliases {
             q.questions.push(Question {
                 name: alias.clone(),
-                qtype: TYPE_ANY,
-                qclass: CLASS_IN,
+                qtype: RType::ANY,
+                qclass: Class::IN,
                 unicast_response: false,
             });
         }
@@ -1904,7 +2107,7 @@ mod tests {
         let many: Vec<IpAddr> = (1..=60u16)
             .map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
             .collect();
-        r.set_addresses(2, many, 0);
+        r.set_addresses(IfIndex::of(2), many, 0);
         r.add_link(V4, 0);
         let (sent, notices) = run(&mut r, 0, 3000);
         assert!(sent.is_empty());
@@ -1913,5 +2116,197 @@ mod tests {
             .filter(|n| matches!(n, Notice::Oversized(..)))
             .collect();
         assert_eq!(oversized, [&Notice::Oversized(V4, name(ALIAS))]);
+    }
+
+    const WEB: &str = "web.myhost.local";
+
+    fn web(rec: Record) -> Record {
+        Record {
+            name: name(WEB),
+            ..rec
+        }
+    }
+
+    fn two_aliases() -> Records {
+        Records {
+            aliases: vec![name(ALIAS), name(WEB)],
+            mode: Mode::Addresses,
+        }
+    }
+
+    #[test]
+    fn collect_lists_each_record_once_and_none_in_both_sections() {
+        let records = two_aliases();
+        let addrs = ["192.0.2.10", "2001:db8::10"].map(ip);
+        // A and AAAA asked together: each is the other's additional record,
+        // but both are answers, so there are none.
+        let q = query(&[
+            (ALIAS, RType::A, true),
+            (ALIAS, RType::AAAA, true),
+            (ALIAS, RType::A, true),
+        ]);
+        let (answers, additionals, all_unicast) = collect(&records, &q, &addrs, TTL, true);
+        assert_eq!(
+            answers,
+            [
+                (AliasId(0), a("192.0.2.10", TTL, true)),
+                (AliasId(0), aaaa("2001:db8::10", TTL, true))
+            ]
+        );
+        assert!(additionals.is_empty());
+        assert!(all_unicast);
+        // Only questions about our aliases count towards all_unicast.
+        let q = query(&[("other.local", RType::A, false), (WEB, RType::A, true)]);
+        let (answers, additionals, all_unicast) = collect(&records, &q, &addrs, TTL, true);
+        assert_eq!(answers, [(AliasId(1), web(a("192.0.2.10", TTL, true)))]);
+        assert_eq!(
+            additionals,
+            [(AliasId(1), web(aaaa("2001:db8::10", TTL, true)))]
+        );
+        assert!(all_unicast);
+        let q = query(&[(WEB, RType::A, true), (ALIAS, RType::A, false)]);
+        assert!(!collect(&records, &q, &addrs, TTL, true).2);
+    }
+
+    #[test]
+    fn a_known_answer_with_half_its_ttl_left_suppresses_just_that_record() {
+        let ours = || {
+            vec![
+                (AliasId(0), a("192.0.2.10", TTL, true)),
+                (AliasId(0), aaaa("2001:db8::10", TTL, true)),
+                (AliasId(1), web(a("192.0.2.10", TTL, true))),
+            ]
+        };
+        let mut records = ours();
+        suppress_known(&mut records, &[a("192.0.2.10", TTL / 2, false)]);
+        assert_eq!(records, ours()[1..]);
+        // Below half its TTL, the querier is due a fresh copy.
+        let mut records = ours();
+        suppress_known(&mut records, &[a("192.0.2.10", TTL / 2 - 1, false)]);
+        assert_eq!(records, ours());
+        // Another alias's record, or another type with the same bytes,
+        // suppresses nothing.
+        let mut records = ours();
+        let other_type = Record {
+            rdata: RData::Other {
+                rtype: RType(16),
+                bytes: vec![192, 0, 2, 10],
+            },
+            ..a("192.0.2.10", TTL, false)
+        };
+        let other_alias = Record {
+            name: name("other.myhost.local"),
+            ..a("192.0.2.10", TTL, false)
+        };
+        suppress_known(&mut records, &[other_type, other_alias]);
+        assert_eq!(records, ours());
+    }
+
+    #[test]
+    fn a_known_answer_of_another_class_suppresses_nothing() {
+        let ours = vec![(AliasId(0), a("192.0.2.10", TTL, true))];
+        let mut records = ours.clone();
+        let chaos = Record {
+            class: Class(3),
+            ..a("192.0.2.10", TTL, false)
+        };
+        suppress_known(&mut records, &[chaos]);
+        assert_eq!(records, ours);
+    }
+
+    #[test]
+    fn a_known_answer_leaves_the_rest_of_the_reply() {
+        let mut r = announced_with(&["192.0.2.10", "2001:db8::10"]);
+        let mut q = query(&[(ALIAS, RType::ANY, false)]);
+        q.answers = vec![a("192.0.2.10", TTL, false)];
+        let msg = one(ask(&mut r, &q, CLIENT, 10_000));
+        assert_eq!(msg.answers, [aaaa("2001:db8::10", TTL, true)]);
+    }
+
+    #[test]
+    fn the_rate_limit_is_per_alias_and_type() {
+        let mut state = LinkState::new(Phase::Announced);
+        state.set_last((AliasId(0), RType::AAAA), 1000);
+        let mut answers = vec![
+            (AliasId(0), a("192.0.2.10", TTL, true)),
+            (AliasId(0), aaaa("2001:db8::10", TTL, true)),
+            (AliasId(1), web(aaaa("2001:db8::10", TTL, true))),
+        ];
+        rate_limit(&mut state, &mut answers, false, 1500);
+        assert_eq!(
+            answers,
+            [
+                (AliasId(0), a("192.0.2.10", TTL, true)),
+                (AliasId(1), web(aaaa("2001:db8::10", TTL, true)))
+            ]
+        );
+        assert_eq!(state.last((AliasId(0), RType::A)), Some(1500));
+        assert_eq!(state.last((AliasId(0), RType::AAAA)), Some(1000));
+        assert_eq!(state.last((AliasId(1), RType::AAAA)), Some(1500));
+        // A record set is free again RATE_LIMIT after it went out.
+        let mut again = vec![(AliasId(0), aaaa("2001:db8::10", TTL, true))];
+        rate_limit(&mut state, &mut again, false, 1000 + RATE_LIMIT);
+        assert_eq!(again.len(), 1);
+    }
+
+    #[test]
+    fn probes_are_exempt_from_the_rate_limit() {
+        let mut state = LinkState::new(Phase::Announced);
+        state.set_last((AliasId(0), RType::A), 1000);
+        let mut answers = vec![(AliasId(0), a("192.0.2.10", TTL, true))];
+        rate_limit(&mut state, &mut answers, true, 1100);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(state.last((AliasId(0), RType::A)), Some(1100));
+    }
+
+    #[test]
+    fn an_a_query_right_after_an_aaaa_multicast_is_answered() {
+        let mut r = announced_with(&["192.0.2.10", "2001:db8::10"]);
+        let aaaa_q = query(&[(ALIAS, RType::AAAA, false)]);
+        let a_q = query(&[(ALIAS, RType::A, false)]);
+        let msg = one(ask(&mut r, &aaaa_q, CLIENT, 3000));
+        assert_eq!(msg.answers, [aaaa("2001:db8::10", TTL, true)]);
+        let msg = one(ask(&mut r, &a_q, CLIENT, 3100));
+        assert_eq!(msg.answers, [a("192.0.2.10", TTL, true)]);
+        assert!(ask(&mut r, &a_q, CLIENT, 3200).is_empty());
+        assert!(ask(&mut r, &aaaa_q, CLIENT, 3200).is_empty());
+    }
+
+    #[test]
+    fn unicast_and_legacy_replies_are_not_rate_limited() {
+        let mut r = announced_with(&["192.0.2.10"]);
+        let qu = query(&[(ALIAS, RType::A, true)]);
+        let qm = query(&[(ALIAS, RType::A, false)]);
+        // Where the one reply went; anything but one reply fails.
+        let dest = |sent: Vec<Outgoing>| {
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            sent[0].dest
+        };
+        for now in [3000, 3001] {
+            assert_eq!(dest(ask(&mut r, &qu, CLIENT, now)), Dest::Unicast(CLIENT));
+            assert_eq!(dest(ask(&mut r, &qm, LEGACY, now)), Dest::Unicast(LEGACY));
+        }
+        // Nor do they count as multicasts for the rate limit.
+        assert_eq!(dest(ask(&mut r, &qm, CLIENT, 3002)), Dest::Multicast);
+    }
+
+    #[test]
+    fn setting_addresses_in_cname_mode_changes_nothing() {
+        let mut r = announced_responder();
+        r.add_link(V4B, 5000);
+        let step = r.set_addresses(IfIndex::of(2), vec![ip("192.0.2.10")], 5000);
+        assert!(step.sends.is_empty());
+        assert!(step.notices.is_empty());
+        let step = r.set_addresses(IfIndex::of(3), vec![ip("198.51.100.10")], 5000);
+        assert!(step.sends.is_empty());
+        assert!(step.notices.is_empty());
+        assert!(matches!(r.links[&V4].phase, Phase::Announced));
+        assert!(matches!(
+            r.links[&V4B].phase,
+            Phase::Probing { sent: 0, .. }
+        ));
+        let step = r.set_addresses(IfIndex::of(2), Vec::new(), 6000);
+        assert!(step.sends.is_empty());
+        assert!(matches!(r.links[&V4].phase, Phase::Announced));
     }
 }

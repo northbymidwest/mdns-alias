@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mdns_alias::wire;
+use mdns_alias::testing::wire;
 
 fuzz_target!(|data: &[u8]| {
     if let Some(msg) = wire::parse(data) {

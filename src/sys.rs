@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 /// prctl reads its optional arguments as `unsigned long`; passing `int`s
 /// leaves their upper halves unspecified, and the kernel rejects
@@ -15,7 +15,8 @@ const ZERO: libc::c_ulong = 0;
 
 /// musl's syscall() reads six `long` arguments whatever the call; passing
 /// fewer, or narrower ones, leaves the rest unspecified. Every raw syscall
-/// goes through here with all six.
+/// goes through here with all six. Only for calls libc has no wrapper for:
+/// neither musl nor the libc crate wraps the Landlock calls.
 ///
 /// # Safety
 ///
@@ -26,9 +27,17 @@ unsafe fn raw_syscall(nr: libc::c_long, args: [libc::c_long; 6]) -> libc::c_long
     unsafe { libc::syscall(nr, a, b, c, d, e, f) }
 }
 
-/// A pointer as a syscall argument word.
+/// A pointer as a syscall argument word. `long` is pointer-sized on every
+/// Linux ABI, so this `as` only reinterprets the address's bits as signed,
+/// losing none; no `From` or `TryFrom` expresses that.
 fn word<T>(p: *const T) -> libc::c_long {
     p.expose_provenance() as libc::c_long
+}
+
+/// The size of `T` as the socket calls take it.
+fn socklen<T>() -> io::Result<libc::socklen_t> {
+    libc::socklen_t::try_from(std::mem::size_of::<T>())
+        .map_err(|_| io::ErrorKind::InvalidInput.into())
 }
 
 fn check(ret: libc::c_int) -> io::Result<libc::c_int> {
@@ -48,22 +57,22 @@ pub fn is_root() -> bool {
 /// Blocks SIGINT and SIGTERM and returns a non-blocking signalfd that
 /// reports them instead, so no handler and no second thread are needed.
 pub fn signalfd() -> io::Result<OwnedFd> {
-    // SAFETY: sigset_t is plain data, initialised by sigemptyset before any
-    // other use; every pointer is to a live local. signalfd returns a new
-    // descriptor that nothing else owns.
+    // SAFETY: sigset_t is plain data, all-zero is a valid value, and
+    // sigemptyset initialises it before any other use; every pointer is to a
+    // live local. signalfd returns a new descriptor that nothing else owns.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGTERM);
+        check(libc::sigemptyset(&raw mut set))?;
+        check(libc::sigaddset(&raw mut set, libc::SIGINT))?;
+        check(libc::sigaddset(&raw mut set, libc::SIGTERM))?;
         check(libc::sigprocmask(
             libc::SIG_BLOCK,
-            &set,
+            &raw const set,
             std::ptr::null_mut(),
         ))?;
         let fd = check(libc::signalfd(
             -1,
-            &set,
+            &raw const set,
             libc::SFD_NONBLOCK | libc::SFD_CLOEXEC,
         ))?;
         Ok(OwnedFd::from_raw_fd(fd))
@@ -72,14 +81,16 @@ pub fn signalfd() -> io::Result<OwnedFd> {
 
 /// Whether a SIGINT or SIGTERM is waiting on `fd`. Consumes one; never
 /// blocks.
-pub fn signal_pending(fd: &OwnedFd) -> bool {
-    // SAFETY: reads at most size_of::<signalfd_siginfo>() bytes into a local
-    // of exactly that size.
-    unsafe {
+pub fn signal_pending(fd: BorrowedFd<'_>) -> bool {
+    let size = std::mem::size_of::<libc::signalfd_siginfo>();
+    // SAFETY: signalfd_siginfo is plain data, valid all-zero; read writes at
+    // most `size` bytes into a live local of exactly that size.
+    let read = unsafe {
         let mut info: libc::signalfd_siginfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::signalfd_siginfo>();
-        libc::read(fd.as_raw_fd(), (&raw mut info).cast(), size) == size as isize
-    }
+        libc::read(fd.as_raw_fd(), (&raw mut info).cast(), size)
+    };
+    // read returns -1 on error, which no usize matches.
+    usize::try_from(read) == Ok(size)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +114,7 @@ pub fn set_limit(limit: Limit, value: u64) -> io::Result<()> {
         rlim_max: value,
     };
     // SAFETY: setrlimit reads one live rlimit struct.
-    check(unsafe { libc::setrlimit(resource, &rlim) }).map(drop)
+    check(unsafe { libc::setrlimit(resource, &raw const rlim) }).map(drop)
 }
 
 /// No exec can ever grant privileges again; also what lets an unprivileged
@@ -121,15 +132,26 @@ pub fn set_not_dumpable() -> io::Result<()> {
 }
 
 /// This thread's kernel id: abort() raises SIGABRT at it, so the seccomp
-/// filter allows tkill for this id alone.
-pub fn thread_id() -> u64 {
-    // SAFETY: gettid ignores its arguments and cannot fail.
-    unsafe { raw_syscall(libc::SYS_gettid, [0; 6]) as u64 }
+/// filter allows tkill for this id alone. musl's gettid makes no system
+/// call: it returns the id cached in the thread's descriptor, the same value
+/// its abort() passes to tkill. Referencing it here also links it in, so
+/// std's panic hook, which binds gettid weakly and makes the syscall only
+/// without it, gets the id without one: the filter allows no gettid.
+pub fn thread_id() -> libc::pid_t {
+    // SAFETY: gettid takes no arguments, reads only this thread's
+    // descriptor and cannot fail.
+    unsafe { libc::gettid() }
 }
 
-pub fn page_size() -> u64 {
+/// The size of a memory page, in bytes. An error if sysconf reports none:
+/// -1, which it returns on failure (not always setting errno), or 0.
+pub fn page_size() -> io::Result<u64> {
     // SAFETY: sysconf takes an integer and touches no memory.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(size)
+        .ok()
+        .filter(|&size| size > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no page size"))
 }
 
 /// Installs `program` as this thread's seccomp filter. No-new-privs must be
@@ -150,13 +172,15 @@ pub fn install_seccomp(program: &[crate::sandbox::Insn]) -> io::Result<()> {
         len,
         filter: filter.as_mut_ptr(),
     };
-    // SAFETY: prog points at `filter`, which outlives the call; the kernel
-    // copies the program before returning.
+    // SAFETY: the third argument points at `prog`, which points at `filter`;
+    // both outlive the call, and the kernel copies the program before
+    // returning. prctl is variadic and reads it as an unsigned long, which
+    // is pointer-sized on Linux.
     check(unsafe {
         libc::prctl(
             libc::PR_SET_SECCOMP,
             libc::c_ulong::from(libc::SECCOMP_MODE_FILTER),
-            word(&raw const prog) as libc::c_ulong,
+            &raw const prog,
             ZERO,
             ZERO,
         )
@@ -198,32 +222,33 @@ pub fn landlock_restrict(ruleset: &crate::sandbox::Landlock) -> io::Result<()> {
         handled_access_net: ruleset.net,
         scoped: ruleset.scoped,
     };
-    debug_assert!(ruleset.size <= std::mem::size_of::<LandlockAttr>());
-    // SAFETY: attr is live and at least `size` bytes; the new descriptor is
-    // owned by `fd` and closed when it drops.
-    unsafe {
-        let size = ruleset.size as libc::c_long;
-        let fd = raw_syscall(
+    // The kernel reads `size` bytes of attr: never more than it has.
+    if ruleset.size > std::mem::size_of::<LandlockAttr>() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let size = libc::c_long::try_from(ruleset.size)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: attr is live and at least `size` bytes, checked above.
+    let fd = unsafe {
+        raw_syscall(
             libc::SYS_landlock_create_ruleset,
             [word(&raw const attr), size, 0, 0, 0, 0],
-        );
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = OwnedFd::from_raw_fd(fd as libc::c_int);
-        let fd_word = libc::c_long::from(fd.as_raw_fd());
-        if raw_syscall(libc::SYS_landlock_restrict_self, [fd_word, 0, 0, 0, 0, 0]) < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = libc::c_int::try_from(fd).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    // SAFETY: the kernel just returned this descriptor, and nothing else
+    // owns it; `fd` closes it when it drops.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd_word = libc::c_long::from(fd.as_raw_fd());
+    // SAFETY: landlock_restrict_self takes a descriptor and flags 0, and
+    // touches no memory of ours.
+    if unsafe { raw_syscall(libc::SYS_landlock_restrict_self, [fd_word, 0, 0, 0, 0, 0]) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Exits at once with `code`, running nothing else: for sandboxed test
-/// children, which could not flush or report anyway.
-pub fn exit_now(code: i32) -> ! {
-    // SAFETY: _exit takes an integer and never returns.
-    unsafe { libc::_exit(code) }
 }
 
 /// Binds netlink socket `fd` to an automatically chosen port and no groups.
@@ -232,46 +257,32 @@ pub fn exit_now(code: i32) -> ! {
 /// Bind replaces the socket's whole group mask, so this must come before
 /// `netlink_subscribe`, never after. Only before lockdown: the seccomp
 /// filter allows no bind.
-pub fn netlink_bind(fd: std::os::fd::RawFd) -> io::Result<()> {
+pub fn netlink_bind(fd: BorrowedFd<'_>) -> io::Result<()> {
     // SAFETY: an all-zero sockaddr_nl is valid (port 0 picks one, no groups).
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    // SAFETY: bind reads size_of::<sockaddr_nl>() bytes from a live local.
-    check(unsafe {
-        libc::bind(
-            fd,
-            (&raw const addr).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    })
-    .map(drop)
+    addr.nl_family = libc::sa_family_t::try_from(libc::AF_NETLINK)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let len = socklen::<libc::sockaddr_nl>()?;
+    // SAFETY: bind reads `len`, size_of::<sockaddr_nl>(), bytes from a live
+    // local.
+    check(unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) }).map(drop)
 }
 
 /// Subscribes netlink socket `fd` to notification group `group` (an
 /// RTNLGRP_* number). Only before lockdown: the seccomp filter allows no
 /// netlink socket options.
-pub fn netlink_subscribe(fd: std::os::fd::RawFd, group: u32) -> io::Result<()> {
-    // SAFETY: setsockopt reads size_of::<u32>() bytes from a live local.
+pub fn netlink_subscribe(fd: BorrowedFd<'_>, group: u32) -> io::Result<()> {
+    let len = socklen::<u32>()?;
+    // SAFETY: setsockopt reads `len`, size_of::<u32>(), bytes from a live
+    // local.
     check(unsafe {
         libc::setsockopt(
-            fd,
+            fd.as_raw_fd(),
             libc::SOL_NETLINK,
             libc::NETLINK_ADD_MEMBERSHIP,
             (&raw const group).cast(),
-            std::mem::size_of::<u32>() as libc::socklen_t,
+            len,
         )
     })
     .map(drop)
-}
-
-/// The local address of netlink socket `fd` as `(port id, group mask)`, from
-/// getsockname. For tests and diagnostics: an unbound socket reports port 0.
-pub fn netlink_local_address(fd: std::os::fd::RawFd) -> io::Result<(u32, u32)> {
-    // SAFETY: an all-zero sockaddr_nl is valid.
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-    // SAFETY: getsockname writes at most `len` bytes into a live local of
-    // exactly that size, and updates `len`.
-    check(unsafe { libc::getsockname(fd, (&raw mut addr).cast(), &raw mut len) })?;
-    Ok((addr.nl_pid, addr.nl_groups))
 }

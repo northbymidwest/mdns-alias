@@ -2,17 +2,17 @@
 
 use crate::wire::Name;
 
-pub const USAGE: &str = "usage: mdns-alias [--host <name.local>] [--cname] [--interface <name>]... [--require-sandbox] <name>...";
+const USAGE: &str = "usage: mdns-alias [--host <name.local>] [--cname] [--interface <name>]... [--require-sandbox] <name>...";
 
 #[derive(Debug, PartialEq)]
 pub struct Cli {
     /// The base for relative names, and the CNAME target in `--cname` mode.
-    pub host: Option<Name>,
+    host: Option<Name>,
     /// `--interface` names; empty means the default set.
     pub interfaces: Vec<String>,
     /// The names as given: relative to the host unless they end in
     /// `.local` (or a dot). `resolve` expands them.
-    pub names: Vec<String>,
+    names: Vec<String>,
     /// Publish CNAMEs of the host instead of address records.
     pub cname: bool,
     /// Exit rather than run with any sandbox layer missing.

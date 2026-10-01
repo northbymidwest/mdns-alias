@@ -8,6 +8,31 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Changed
+
+- A receive that fails with anything but a timeout now waits out the 100 ms
+  receive timeout before retrying, so a dead socket no longer spins the
+  loop. Each family logs its first failure as `receive on IPv4 failed:
+  <error>; retrying, and logging again at most once a minute`, then at most
+  once a minute, with a count of the failures skipped since the last line
+  (`receive on IPv4 failed: <error> (3 more not logged); ...`). Recovery is
+  logged once, as `receiving on IPv4 works again`, followed by ` (1 more
+  failure not logged)` or ` (N more failures not logged)` if any were
+  skipped.
+- The seccomp allowlist now allows `clock_nanosleep`, on the monotonic clock
+  and relative only, for that wait, and no longer allows `gettid`: a panic
+  still reports its thread id, read without the syscall.
+- If the page size cannot be read, the address-space limit is skipped and
+  logged as missing (`sandbox: address-space limit unavailable (<error>)`)
+  instead of being computed from a bad value.
+
+### Fixed
+
+- Interfaces that go away are now forgotten. Before, each one left its
+  address list behind for the life of the process.
+
 ## 0.5.0 - 2026-10-01
 
 ### Changed

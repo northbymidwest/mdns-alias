@@ -2,10 +2,11 @@
 //! with the host's own responder, joined to the mDNS group on each interface
 //! served.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::AsRawFd;
+use std::num::NonZeroU32;
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
 use socket_pktinfo::PktInfoUdpSocket;
@@ -13,11 +14,36 @@ use socket2::{Domain, SockAddr, SockRef};
 
 use crate::responder::{Dest, Family, Link, MDNS_PORT, Outgoing};
 
+/// An interface index as the kernel numbers interfaces: never 0, and its
+/// own type so it cannot be mixed up with the flag words beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IfIndex(NonZeroU32);
+
+impl IfIndex {
+    /// `None` for 0, which is no interface.
+    pub const fn new(index: u32) -> Option<IfIndex> {
+        match NonZeroU32::new(index) {
+            Some(index) => Some(IfIndex(index)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Index `index`, which must not be 0.
+    #[cfg(test)]
+    pub const fn of(index: u32) -> IfIndex {
+        IfIndex::new(index).expect("interface index 0")
+    }
+}
+
 const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
-/// How long a receive waits before the loop moves on to the other socket
-/// and to due timers. mDNS tolerates far more latency than this.
-const RECV_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long a receive waits for a packet; also how long the loop waits after
+/// one fails, so a dead socket cannot spin it.
+pub const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Container bridges and veths, skipped unless named with `--interface`:
 /// nothing on them resolves the host's LAN names.
 const SKIPPED_PREFIXES: [&str; 3] = ["docker", "br-", "veth"];
@@ -28,31 +54,51 @@ pub struct Net {
     v6: Option<PktInfoUdpSocket>,
     /// `--interface` names; empty means the default set.
     only: Vec<String>,
+    /// The links served: joined to the group, and the only ones whose
+    /// packets reach the responder.
     joined: BTreeMap<Link, Joined>,
     /// Named interfaces last reported as unserved, so each absence is logged
     /// once rather than on every rescan.
     unserved: Vec<String>,
-    /// Each served link's addresses and prefix lengths, for the source
-    /// check. Replaced on every successful rescan.
-    subnets: Subnets,
     /// Each served interface's stable addresses as of the last rescan.
-    addrs: Vec<(u32, Vec<IpAddr>)>,
+    addrs: Vec<(IfIndex, Vec<IpAddr>)>,
     /// Link and address change notifications, if the host allows them.
     #[cfg(target_os = "linux")]
     events: Option<socket2::Socket>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     event_buf: Vec<u8>,
     drops: DropLog,
-    /// Lines to log, collected by `take_log`.
+    /// Lines to log, from opening, rescans and receives; collected by
+    /// `take_log`.
     log: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct Joined {
     name: String,
-    /// IPv4 group membership is keyed by an interface address, so a change
-    /// of address means leaving and joining again. IPv6 uses the index.
-    v4: Option<Ipv4Addr>,
+    membership: Membership,
+    /// The link's addresses and prefix lengths, for the source check.
+    /// Updated on every successful rescan; a change here alone is not a
+    /// reason to join again.
+    subnets: Vec<(IpAddr, u8)>,
+}
+
+impl Joined {
+    /// Whether `other` is the same group membership on the same interface,
+    /// whatever the subnets: if so, the link stays joined as it is.
+    fn same_membership(&self, other: &Joined) -> bool {
+        self.name == other.name && self.membership == other.membership
+    }
+}
+
+/// What a link's group membership is keyed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    /// IPv4 membership is keyed by an interface address, so a change of
+    /// address means leaving and joining again.
+    V4(Ipv4Addr),
+    /// IPv6 membership is keyed by the interface index alone.
+    V6,
 }
 
 #[derive(Debug, Default)]
@@ -62,8 +108,7 @@ pub struct Rescan {
     /// Links that are gone: forget them.
     pub removed: Vec<Link>,
     /// Interfaces whose stable addresses changed, with the new sets; empty for interfaces no longer served.
-    pub addresses: Vec<(u32, Vec<IpAddr>)>,
-    pub log: Vec<String>,
+    pub addresses: Vec<(IfIndex, Vec<IpAddr>)>,
 }
 
 pub struct Received {
@@ -74,33 +119,32 @@ pub struct Received {
 
 /// One address on one interface, whichever way the platform lists them.
 #[derive(Clone, Debug)]
-pub struct Interface {
-    pub name: String,
-    pub index: u32,
+struct Interface {
+    name: String,
+    index: IfIndex,
     /// Administratively up and with a carrier.
-    pub up: bool,
-    pub loopback: bool,
-    pub point_to_point: bool,
-    pub multicast: bool,
-    pub addr: IpAddr,
-    pub prefix: u8,
+    up: bool,
+    loopback: bool,
+    point_to_point: bool,
+    multicast: bool,
+    addr: IpAddr,
+    prefix: u8,
     /// Settled and lasting enough to publish (see netlink::AddrInfo::stable).
-    pub stable: bool,
+    stable: bool,
 }
 
 impl Net {
     /// Opens a socket per family. One family failing, as IPv6 does on a
-    /// host that disables it, leaves the other serving, with a line to log
-    /// saying so; both failing is an error.
-    pub fn open(only: Vec<String>) -> io::Result<(Net, Vec<String>)> {
+    /// host that disables it, leaves the other serving, with a line for
+    /// `take_log` saying so; both failing is an error.
+    pub fn open(only: Vec<String>) -> io::Result<Net> {
         let mut log = Vec::new();
         let (v4, v6) = match (socket(Family::V4), socket(Family::V6)) {
             (Err(e), Err(_)) => return Err(e),
             (v4, v6) => {
                 for (family, result) in [(Family::V4, &v4), (Family::V6, &v6)] {
                     if let Err(e) = result {
-                        let name = family_name(family);
-                        log.push(format!("{name} unavailable, serving without it: {e}"));
+                        log.push(format!("{family} unavailable, serving without it: {e}"));
                     }
                 }
                 (v4.ok(), v6.ok())
@@ -116,55 +160,62 @@ impl Net {
                 None
             }
         };
-        let net = Net {
+        Ok(Net {
             v4,
             v6,
             only,
             joined: BTreeMap::new(),
             unserved: Vec::new(),
-            subnets: Vec::new(),
             addrs: Vec::new(),
             #[cfg(target_os = "linux")]
             events,
+            #[cfg(target_os = "linux")]
             event_buf: vec![0; 8192],
             drops: DropLog::default(),
-            log: Vec::new(),
-        };
-        Ok((net, log))
+            log,
+        })
     }
 
-    /// Brings group membership in line with the interfaces present now.
+    /// Brings group membership in line with the interfaces present now,
+    /// with what it did for `take_log`.
     pub fn rescan(&mut self) -> Rescan {
-        let mut scan = Rescan::default();
-        let ifs = match list_interfaces() {
-            Ok(ifs) => ifs,
+        match list_interfaces() {
+            Ok(ifs) => self.reconcile(&ifs, &self.families()),
             Err(e) => {
-                scan.log.push(format!("cannot list interfaces: {e}"));
-                return scan;
+                self.log.push(format!("cannot list interfaces: {e}"));
+                Rescan::default()
             }
-        };
-        let want = wanted(&ifs, &self.only, &self.families());
-        self.subnets = subnets(&ifs, &want);
-        let stable = stable_addresses(&ifs, &want);
+        }
+    }
+
+    /// `rescan` for these interfaces, serving these families.
+    fn reconcile(&mut self, ifs: &[Interface], families: &[Family]) -> Rescan {
+        let mut scan = Rescan::default();
+        let want = wanted(ifs, &self.only, families);
+        let stable = stable_addresses(ifs, &want);
         scan.addresses = address_changes(&self.addrs, &stable);
         self.addrs = stable;
         self.drops.reset();
         while let Some(&link) = self.joined.keys().find(|link| !want.contains_key(link)) {
-            scan.log.push(format!("left {}", self.describe(link)));
+            self.log.push(format!("left {}", self.describe(link)));
             self.leave(link);
             scan.removed.push(link);
         }
         let unserved = unserved(&self.only, &want);
         for name in unserved.iter().filter(|n| !self.unserved.contains(n)) {
-            scan.log.push(format!(
+            self.log.push(format!(
                 "interface {name} is missing or not usable, will use it when it appears"
             ));
         }
         self.unserved = unserved;
         for (link, joined) in want {
-            // An address change keeps the link, and its records, as they are.
-            let changed = match self.joined.get(&link) {
-                Some(current) if *current == joined => continue,
+            // An address change keeps the link, and its records, as they
+            // are; only the subnets for the source check move on.
+            let changed = match self.joined.get_mut(&link) {
+                Some(current) if current.same_membership(&joined) => {
+                    current.subnets = joined.subnets;
+                    continue;
+                }
                 current => current.is_some(),
             };
             if changed {
@@ -174,15 +225,14 @@ impl Net {
                 Ok(()) => {
                     self.joined.insert(link, joined);
                     if !changed {
-                        scan.log.push(format!("joined {}", self.describe(link)));
+                        self.log.push(format!("joined {}", self.describe(link)));
                         scan.added.push(link);
                     }
                 }
                 Err(e) => {
-                    scan.log.push(format!(
+                    self.log.push(format!(
                         "cannot join {} ({}): {e}",
-                        joined.name,
-                        family_name(link.family)
+                        joined.name, link.family
                     ));
                     if changed {
                         scan.removed.push(link);
@@ -200,15 +250,17 @@ impl Net {
         };
         match sock.recv(buf) {
             Ok((len, info)) => {
-                // Index 0 is never a link we serve, so the packet is ignored.
-                let index = u32::try_from(info.if_index).unwrap_or(0);
+                // Index 0, or one out of range, is no interface we serve.
+                let Some(index) = u32::try_from(info.if_index).ok().and_then(IfIndex::new) else {
+                    return Ok(None);
+                };
                 let link = Link { index, family };
                 // Off-link senders (RFC 6762 section 11), and anything on a
                 // link we do not serve, never reach the responder. Off-link
                 // drops on a served link are logged once per rescan: a
                 // netmask that does not cover the LAN should not fail
                 // silently.
-                match verdict(&self.subnets, link, info.addr_src.ip()) {
+                match verdict(&self.joined, link, info.addr_src.ip()) {
                     Verdict::Accept => {}
                     Verdict::Unserved => return Ok(None),
                     Verdict::OffLink => {
@@ -248,25 +300,30 @@ impl Net {
         let dest = match (out.link.family, out.dest) {
             (_, Dest::Unicast(addr)) => addr,
             (Family::V4, Dest::Multicast) => SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT)),
-            (Family::V6, Dest::Multicast) => {
-                SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, out.link.index))
-            }
+            (Family::V6, Dest::Multicast) => SocketAddr::V6(SocketAddrV6::new(
+                GROUP_V6,
+                MDNS_PORT,
+                0,
+                out.link.index.get(),
+            )),
         };
         let dest = SockAddr::from(dest);
         match out.link.family {
             Family::V4 => {
-                let addr = self
-                    .joined
-                    .get(&out.link)
-                    .and_then(|j| j.v4)
-                    .ok_or(io::ErrorKind::NotFound)?;
+                let Some(Joined {
+                    membership: Membership::V4(addr),
+                    ..
+                }) = self.joined.get(&out.link)
+                else {
+                    return Err(io::ErrorKind::NotFound.into());
+                };
                 let sock = self.socket(Family::V4)?;
-                sock.set_multicast_if_v4(&addr)?;
+                sock.set_multicast_if_v4(addr)?;
                 sock.send_to(&out.packet, &dest)?;
             }
             Family::V6 => {
                 let sock = self.socket(Family::V6)?;
-                sock.set_multicast_if_v6(out.link.index)?;
+                sock.set_multicast_if_v6(out.link.index.get())?;
                 sock.send_to(&out.packet, &dest)?;
             }
         }
@@ -283,23 +340,21 @@ impl Net {
         let Ok(sock) = self.socket(link.family) else {
             return;
         };
-        let _ = match (link.family, joined.v4) {
-            (Family::V4, Some(addr)) => sock.leave_multicast_v4(&GROUP_V4, &addr),
-            (Family::V6, _) => sock.leave_multicast_v6(&GROUP_V6, link.index),
-            (Family::V4, None) => Ok(()),
+        let _ = match joined.membership {
+            Membership::V4(addr) => sock.leave_multicast_v4(&GROUP_V4, &addr),
+            Membership::V6 => sock.leave_multicast_v6(&GROUP_V6, link.index.get()),
         };
     }
 
-    /// The highest descriptor the sockets hold, so the sandbox can cap new
-    /// descriptors just above it.
-    pub fn highest_fd(&self) -> i32 {
+    /// The descriptors the sockets hold, for the sandbox's descriptor cap.
+    pub fn fds(&self) -> Vec<RawFd> {
         let sockets = [&self.v4, &self.v6]
             .into_iter()
             .flatten()
             .map(|sock| sock.as_raw_fd());
         #[cfg(target_os = "linux")]
         let sockets = sockets.chain(self.events.iter().map(|sock| sock.as_raw_fd()));
-        sockets.max().unwrap_or(-1)
+        sockets.collect()
     }
 
     /// Whether change notifications arrive, so polling can be slow.
@@ -320,7 +375,7 @@ impl Net {
     }
 
     /// The name of a served interface, for logs.
-    pub fn interface_name(&self, index: u32) -> Option<&str> {
+    pub fn interface_name(&self, index: IfIndex) -> Option<&str> {
         self.joined
             .iter()
             .find(|(link, _)| link.index == index)
@@ -343,7 +398,7 @@ impl Net {
     /// `enp1s0 (IPv4)`, for logs.
     pub fn describe(&self, link: Link) -> String {
         let name = self.joined.get(&link).map_or("?", |j| j.name.as_str());
-        format!("{name} ({})", family_name(link.family))
+        format!("{name} ({})", link.family)
     }
 
     fn socket(&self, family: Family) -> io::Result<&PktInfoUdpSocket> {
@@ -364,18 +419,10 @@ impl Net {
 
     fn join(&self, link: Link, joined: &Joined) -> io::Result<()> {
         let sock = self.socket(link.family)?;
-        match (link.family, joined.v4) {
-            (Family::V4, Some(addr)) => sock.join_multicast_v4(&GROUP_V4, &addr),
-            (Family::V6, _) => sock.join_multicast_v6(&GROUP_V6, link.index),
-            (Family::V4, None) => Err(io::ErrorKind::InvalidInput.into()),
+        match joined.membership {
+            Membership::V4(addr) => sock.join_multicast_v4(&GROUP_V4, &addr),
+            Membership::V6 => sock.join_multicast_v6(&GROUP_V6, link.index.get()),
         }
-    }
-}
-
-fn family_name(family: Family) -> &'static str {
-    match family {
-        Family::V4 => "IPv4",
-        Family::V6 => "IPv6",
     }
 }
 
@@ -442,9 +489,9 @@ fn wanted(ifs: &[Interface], only: &[String], families: &[Family]) -> BTreeMap<L
         if !chosen {
             continue;
         }
-        let (family, v4) = match i.addr {
-            IpAddr::V4(addr) => (Family::V4, Some(addr)),
-            IpAddr::V6(_) => (Family::V6, None),
+        let (family, membership) = match i.addr {
+            IpAddr::V4(addr) => (Family::V4, Membership::V4(addr)),
+            IpAddr::V6(_) => (Family::V6, Membership::V6),
         };
         if !families.contains(&family) {
             continue;
@@ -455,8 +502,18 @@ fn wanted(ifs: &[Interface], only: &[String], families: &[Family]) -> BTreeMap<L
         })
         .or_insert(Joined {
             name: i.name.clone(),
-            v4,
+            membership,
+            subnets: Vec::new(),
         });
+    }
+    // Every address on the interface in the link's family counts for the
+    // source check.
+    for (link, joined) in &mut want {
+        joined.subnets = ifs
+            .iter()
+            .filter(|i| i.index == link.index && i.addr.is_ipv4() == (link.family == Family::V4))
+            .map(|i| (i.addr, i.prefix))
+            .collect();
     }
     want
 }
@@ -472,55 +529,80 @@ fn unserved(only: &[String], want: &BTreeMap<Link, Joined>) -> Vec<String> {
     out
 }
 
-/// Each served link's addresses and prefix lengths, ordered by link.
-type Subnets = Vec<(Link, Vec<(IpAddr, u8)>)>;
-
-/// Each served link's addresses and prefix lengths, in the order of `want`.
-fn subnets(ifs: &[Interface], want: &BTreeMap<Link, Joined>) -> Subnets {
-    let mut out = Vec::new();
-    for &link in want.keys() {
-        let mut list = Vec::new();
-        for i in ifs {
-            if i.index == link.index && i.addr.is_ipv4() == (link.family == Family::V4) {
-                list.push((i.addr, i.prefix));
-            }
-        }
-        out.push((link, list));
-    }
-    out
-}
-
 /// What to do with a packet from `source` on `link`.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     Accept,
-    /// A link we do not serve: Linux delivers group traffic joined by any
-    /// socket to every one, so this is normal.
+    /// A link we do not serve, or whose join failed: Linux delivers group
+    /// traffic joined by any socket to every one, so this is normal.
     Unserved,
     /// A served link, but the source is not on-link there.
     OffLink,
 }
 
-fn verdict(subnets: &Subnets, link: Link, source: IpAddr) -> Verdict {
-    match subnets.iter().find(|(l, _)| *l == link).map(|(_, s)| s) {
+fn verdict(joined: &BTreeMap<Link, Joined>, link: Link, source: IpAddr) -> Verdict {
+    match joined.get(&link) {
         None => Verdict::Unserved,
-        Some(s) if on_link(source, s) => Verdict::Accept,
+        Some(j) if on_link(source, &j.subnets) => Verdict::Accept,
         Some(_) => Verdict::OffLink,
     }
 }
 
-/// The links that have logged an off-link drop since the last rescan.
+/// The links that have logged an off-link drop since the last rescan. At
+/// most one entry per served link, so a list is plenty, and it costs less
+/// code than another B-tree.
 #[derive(Debug, Default)]
-struct DropLog(BTreeSet<Link>);
+struct DropLog(Vec<Link>);
 
 impl DropLog {
     /// Whether this is the first drop on `link` since the last reset.
     fn first(&mut self, link: Link) -> bool {
-        self.0.insert(link)
+        if self.0.contains(&link) {
+            return false;
+        }
+        self.0.push(link);
+        true
     }
 
     fn reset(&mut self) {
         self.0.clear();
+    }
+}
+
+/// Milliseconds between repeats of a receive error's log line while it
+/// persists.
+const FAILURE_REPEAT: u64 = 60_000;
+
+/// Rate-limits the log of one socket's receive errors: the first is logged,
+/// repeats only once a minute, with a count of those skipped, and recovery
+/// once.
+#[derive(Debug, Default)]
+pub struct FailureLog {
+    /// While failing: when a line was last logged, and the errors since.
+    run: Option<(u64, u64)>,
+}
+
+impl FailureLog {
+    /// Records a failure at `now` (ms). `Some(n)` means log it, noting the
+    /// `n` repeats skipped since the last line.
+    pub fn failed(&mut self, now: u64) -> Option<u64> {
+        match &mut self.run {
+            Some((logged, skipped)) if now.saturating_sub(*logged) < FAILURE_REPEAT => {
+                *skipped += 1;
+                None
+            }
+            run => {
+                let skipped = run.map_or(0, |(_, skipped)| skipped);
+                *run = Some((now, 0));
+                Some(skipped)
+            }
+        }
+    }
+
+    /// Records a good receive. `Some(n)` if it ends a run of failures,
+    /// which deserves a line noting the `n` skipped since the last one.
+    pub fn recovered(&mut self) -> Option<u64> {
+        self.run.take().map(|(_, skipped)| skipped)
     }
 }
 
@@ -559,9 +641,12 @@ fn same_prefix(a: IpAddr, b: IpAddr, prefix: u8) -> bool {
 }
 
 /// Each served interface's stable addresses, sorted.
-fn stable_addresses(ifs: &[Interface], want: &BTreeMap<Link, Joined>) -> Vec<(u32, Vec<IpAddr>)> {
+fn stable_addresses(
+    ifs: &[Interface],
+    want: &BTreeMap<Link, Joined>,
+) -> Vec<(IfIndex, Vec<IpAddr>)> {
     // `want` is ordered by link, so this comes out ordered by index.
-    let mut stable: Vec<(u32, Vec<IpAddr>)> = Vec::new();
+    let mut stable: Vec<(IfIndex, Vec<IpAddr>)> = Vec::new();
     for link in want.keys() {
         if stable.last().is_none_or(|(index, _)| *index != link.index) {
             stable.push((link.index, Vec::new()));
@@ -585,11 +670,10 @@ fn stable_addresses(ifs: &[Interface], want: &BTreeMap<Link, Joined>) -> Vec<(u3
 /// Both lists must be strictly ascending by interface index, as
 /// `stable_addresses` returns them; one merge pass relies on that and
 /// returns the changes in the same order.
-#[inline(never)]
 fn address_changes(
-    old: &[(u32, Vec<IpAddr>)],
-    new: &[(u32, Vec<IpAddr>)],
-) -> Vec<(u32, Vec<IpAddr>)> {
+    old: &[(IfIndex, Vec<IpAddr>)],
+    new: &[(IfIndex, Vec<IpAddr>)],
+) -> Vec<(IfIndex, Vec<IpAddr>)> {
     debug_assert!(old.windows(2).all(|w| w[0].0 < w[1].0));
     debug_assert!(new.windows(2).all(|w| w[0].0 < w[1].0));
     let mut changes = Vec::new();
@@ -617,39 +701,55 @@ fn address_changes(
 }
 
 /// Quiet time after the last change notification before rescanning.
-pub const SETTLE_QUIET: u64 = 250;
+const SETTLE_QUIET: u64 = 250;
 /// Longest wait after the first notification of a burst.
-pub const SETTLE_MAX: u64 = 2000;
+const SETTLE_MAX: u64 = 2000;
 
 /// When to rescan after change notifications: once they have been quiet for
-/// `SETTLE_QUIET` ms, but no later than `SETTLE_MAX` ms after the first.
+/// `SETTLE_QUIET` ms, but no later than `SETTLE_MAX` ms after the first; at
+/// once if some were lost.
 #[derive(Debug, Default)]
-pub struct Settle {
-    first: Option<u64>,
-    last: u64,
-    now: bool,
+pub enum Settle {
+    /// No notification since the last rescan.
+    #[default]
+    Idle,
+    /// Notifications arrived, the first and the last at these times (ms).
+    Burst { first: u64, last: u64 },
+    /// Notifications were lost; later ones change nothing.
+    Overflow,
 }
 
 impl Settle {
     pub fn changed(&mut self, now: u64) {
-        self.first.get_or_insert(now);
-        self.last = now;
+        match self {
+            Settle::Idle => {
+                *self = Settle::Burst {
+                    first: now,
+                    last: now,
+                }
+            }
+            Settle::Burst { last, .. } => *last = now,
+            Settle::Overflow => {}
+        }
     }
 
     /// Notifications were lost: rescan at once.
     pub fn overflowed(&mut self) {
-        self.now = true;
+        *self = Settle::Overflow;
     }
 
     pub fn due(&self, now: u64) -> bool {
-        self.now
-            || self
-                .first
-                .is_some_and(|first| now >= self.last + SETTLE_QUIET || now >= first + SETTLE_MAX)
+        match *self {
+            Settle::Idle => false,
+            Settle::Burst { first, last } => {
+                now >= last + SETTLE_QUIET || now >= first + SETTLE_MAX
+            }
+            Settle::Overflow => true,
+        }
     }
 
     pub fn clear(&mut self) {
-        *self = Settle::default();
+        *self = Settle::Idle;
     }
 }
 
@@ -688,7 +788,7 @@ fn list_interfaces() -> io::Result<Vec<Interface>> {
                 IfAddr::V6(a) => a.prefixlen,
             };
             Some(Interface {
-                index: i.index?,
+                index: IfIndex::new(i.index?)?,
                 up: i.is_oper_up(),
                 loopback: i.is_loopback(),
                 point_to_point: i.is_p2p(),
@@ -713,7 +813,7 @@ mod tests {
         let addr: IpAddr = ip.parse().unwrap();
         Interface {
             name: name.into(),
-            index,
+            index: IfIndex::of(index),
             up: true,
             loopback: addr.is_loopback(),
             point_to_point: false,
@@ -784,11 +884,11 @@ mod tests {
         let want = wanted(&ifs, &[], &BOTH);
         assert_eq!(
             want[&Link {
-                index: 2,
+                index: IfIndex::of(2),
                 family: Family::V4
             }]
-                .v4,
-            Some(Ipv4Addr::new(192, 0, 2, 10))
+                .membership,
+            Membership::V4(Ipv4Addr::new(192, 0, 2, 10))
         );
     }
 
@@ -875,6 +975,11 @@ mod tests {
         ));
     }
 
+    const ENP1S0_V4: Link = Link {
+        index: IfIndex::of(2),
+        family: Family::V4,
+    };
+
     #[test]
     fn subnets_cover_only_served_links() {
         let ifs = [
@@ -882,48 +987,154 @@ mod tests {
             iface("enp1s0", 2, "10.0.0.5"),
             iface("docker0", 4, "172.17.0.1"),
         ];
-        let subnets = subnets(&ifs, &wanted(&ifs, &[], &BOTH));
-        assert_eq!(subnets.len(), 1);
+        let want = wanted(&ifs, &[], &BOTH);
+        assert_eq!(want.len(), 1);
         assert_eq!(
-            subnets[0],
-            (
-                Link {
-                    index: 2,
-                    family: Family::V4
-                },
-                vec![subnet("192.0.2.10", 24), subnet("10.0.0.5", 24)]
-            )
+            want[&ENP1S0_V4].subnets,
+            [subnet("192.0.2.10", 24), subnet("10.0.0.5", 24)]
         );
     }
 
     #[test]
     fn packets_are_accepted_only_from_on_link_senders_on_served_links() {
         let ifs = [iface("enp1s0", 2, "192.0.2.10")];
-        let subnets = subnets(&ifs, &wanted(&ifs, &[], &BOTH));
-        let served = Link {
-            index: 2,
-            family: Family::V4,
-        };
+        let joined = wanted(&ifs, &[], &BOTH);
         let other = Link {
-            index: 4,
+            index: IfIndex::of(4),
             family: Family::V4,
         };
         let source = "192.0.2.20".parse().unwrap();
-        assert_eq!(verdict(&subnets, served, source), Verdict::Accept);
-        assert_eq!(verdict(&subnets, other, source), Verdict::Unserved);
+        assert_eq!(verdict(&joined, ENP1S0_V4, source), Verdict::Accept);
+        assert_eq!(verdict(&joined, other, source), Verdict::Unserved);
         let far = "198.51.100.7".parse().unwrap();
-        assert_eq!(verdict(&subnets, served, far), Verdict::OffLink);
+        assert_eq!(verdict(&joined, ENP1S0_V4, far), Verdict::OffLink);
+    }
+
+    /// A `Net` without sockets, so every join fails, that has already
+    /// joined `joined`.
+    fn unconnected(joined: BTreeMap<Link, Joined>) -> Net {
+        Net {
+            v4: None,
+            v6: None,
+            only: Vec::new(),
+            joined,
+            unserved: Vec::new(),
+            addrs: Vec::new(),
+            #[cfg(target_os = "linux")]
+            events: None,
+            #[cfg(target_os = "linux")]
+            event_buf: Vec::new(),
+            drops: DropLog::default(),
+            log: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_link_whose_join_failed_does_not_pass_the_source_check() {
+        let ifs = [iface("enp1s0", 2, "192.0.2.10")];
+        let mut net = unconnected(BTreeMap::new());
+        let scan = net.reconcile(&ifs, &[Family::V4]);
+        assert!(scan.added.is_empty() && scan.removed.is_empty());
+        let log = net.take_log();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].starts_with("cannot join enp1s0 (IPv4): "), "{log:?}");
+        assert!(!net.serves(ENP1S0_V4));
+        let source = "192.0.2.20".parse().unwrap();
+        assert_eq!(verdict(&net.joined, ENP1S0_V4, source), Verdict::Unserved);
+    }
+
+    #[test]
+    fn a_rescan_logs_leaving_then_unserved_then_joining() {
+        let old = [iface("enp1s0", 2, "192.0.2.10")];
+        let mut net = unconnected(wanted(&old, &[], &[Family::V4]));
+        net.only = vec!["enp2s0".into(), "missing0".into()];
+        let now = [
+            iface("enp1s0", 2, "192.0.2.10"),
+            iface("enp2s0", 3, "198.51.100.10"),
+        ];
+        net.reconcile(&now, &[Family::V4]);
+        let log = net.take_log();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert_eq!(log[0], "left enp1s0 (IPv4)");
+        assert_eq!(
+            log[1],
+            "interface missing0 is missing or not usable, will use it when it appears"
+        );
+        assert!(log[2].starts_with("cannot join enp2s0 (IPv4): "), "{log:?}");
+    }
+
+    #[test]
+    fn an_address_only_change_keeps_the_link_and_updates_its_subnets() {
+        let before = [iface("enp1s0", 2, "192.0.2.10")];
+        let mut net = unconnected(wanted(&before, &[], &[Family::V4]));
+        net.reconcile(&before, &[Family::V4]);
+        let new_source = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            verdict(&net.joined, ENP1S0_V4, new_source),
+            Verdict::OffLink
+        );
+        // A second address, and a wider prefix on the first, which stays
+        // the membership address: no rejoin, which here would fail.
+        let mut wider = iface("enp1s0", 2, "192.0.2.10");
+        wider.prefix = 16;
+        let after = [wider, iface("enp1s0", 2, "198.51.100.10")];
+        let scan = net.reconcile(&after, &[Family::V4]);
+        assert!(scan.added.is_empty() && scan.removed.is_empty());
+        assert_eq!(scan.addresses.len(), 1);
+        assert!(net.take_log().is_empty());
+        assert!(net.serves(ENP1S0_V4));
+        assert_eq!(
+            net.joined[&ENP1S0_V4].subnets,
+            [subnet("192.0.2.10", 16), subnet("198.51.100.10", 24)]
+        );
+        assert_eq!(verdict(&net.joined, ENP1S0_V4, new_source), Verdict::Accept);
+        // A new membership address does mean joining again, which fails
+        // here and drops the link.
+        let moved = [iface("enp1s0", 2, "192.0.2.11")];
+        let scan = net.reconcile(&moved, &[Family::V4]);
+        assert_eq!(scan.removed, [ENP1S0_V4]);
+        assert!(!net.serves(ENP1S0_V4));
+    }
+
+    #[test]
+    fn receive_errors_are_logged_first_then_once_a_minute() {
+        let mut log = FailureLog::default();
+        assert_eq!(log.failed(1_000), Some(0));
+        assert_eq!(log.failed(1_100), None);
+        assert_eq!(log.failed(60_999), None);
+        // A minute after the line, with the two skipped repeats counted.
+        assert_eq!(log.failed(61_000), Some(2));
+        assert_eq!(log.failed(61_100), None);
+        assert_eq!(log.failed(121_000), Some(1));
+    }
+
+    #[test]
+    fn receive_recovery_is_logged_once_and_rearms_the_log() {
+        let mut log = FailureLog::default();
+        assert_eq!(log.recovered(), None);
+        assert_eq!(log.failed(0), Some(0));
+        assert_eq!(log.recovered(), Some(0));
+        assert_eq!(log.recovered(), None);
+        // A new failure right after is a first one again.
+        assert_eq!(log.failed(10), Some(0));
+        // Recovery counts the failures skipped since the last line.
+        assert_eq!(log.failed(20), None);
+        assert_eq!(log.failed(30), None);
+        assert_eq!(log.failed(40), None);
+        assert_eq!(log.recovered(), Some(3));
+        assert_eq!(log.failed(50), Some(0));
+        assert_eq!(log.recovered(), Some(0));
     }
 
     #[test]
     fn off_link_drops_are_logged_once_per_link_per_rescan() {
         let mut log = DropLog::default();
         let a = Link {
-            index: 2,
+            index: IfIndex::of(2),
             family: Family::V4,
         };
         let b = Link {
-            index: 2,
+            index: IfIndex::of(2),
             family: Family::V6,
         };
         assert!(log.first(a));
@@ -946,7 +1157,7 @@ mod tests {
         let want = wanted(&ifs, &[], &BOTH);
         let stable = stable_addresses(&ifs, &want);
         assert_eq!(stable.len(), 1);
-        assert_eq!(stable[0].0, 2);
+        assert_eq!(stable[0].0, IfIndex::of(2));
         assert_eq!(
             stable[0].1,
             [
@@ -958,26 +1169,35 @@ mod tests {
 
     #[test]
     fn changed_and_new_interfaces_are_reported() {
-        let old = vec![(2, vec!["192.0.2.10".parse::<IpAddr>().unwrap()])];
+        let old = vec![(
+            IfIndex::of(2),
+            vec!["192.0.2.10".parse::<IpAddr>().unwrap()],
+        )];
         let same = old.clone();
         assert!(address_changes(&old, &same).is_empty());
         let moved = vec![
-            (2, vec!["192.0.2.11".parse::<IpAddr>().unwrap()]),
-            (3, vec!["198.51.100.10".parse().unwrap()]),
+            (
+                IfIndex::of(2),
+                vec!["192.0.2.11".parse::<IpAddr>().unwrap()],
+            ),
+            (IfIndex::of(3), vec!["198.51.100.10".parse().unwrap()]),
         ];
         assert_eq!(
             address_changes(&old, &moved),
             [
-                (2, vec!["192.0.2.11".parse().unwrap()]),
-                (3, vec!["198.51.100.10".parse().unwrap()])
+                (IfIndex::of(2), vec!["192.0.2.11".parse().unwrap()]),
+                (IfIndex::of(3), vec!["198.51.100.10".parse().unwrap()])
             ]
         );
     }
 
     #[test]
     fn departed_interfaces_report_empty_address_sets() {
-        let old = vec![(2, vec!["192.0.2.10".parse::<IpAddr>().unwrap()])];
-        assert_eq!(address_changes(&old, &[]), [(2, Vec::new())]);
+        let old = vec![(
+            IfIndex::of(2),
+            vec!["192.0.2.10".parse::<IpAddr>().unwrap()],
+        )];
+        assert_eq!(address_changes(&old, &[]), [(IfIndex::of(2), Vec::new())]);
     }
 
     #[test]
@@ -1008,5 +1228,18 @@ mod tests {
         let mut s = Settle::default();
         s.overflowed();
         assert!(s.due(0));
+        // Later notifications do not turn it back into a wait.
+        s.changed(0);
+        assert!(s.due(0));
+    }
+
+    #[test]
+    fn an_overflow_during_a_burst_is_due_at_once() {
+        let mut s = Settle::default();
+        s.changed(1000);
+        s.overflowed();
+        assert!(s.due(1000));
+        s.clear();
+        assert!(!s.due(9000));
     }
 }

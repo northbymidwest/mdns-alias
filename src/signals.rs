@@ -8,7 +8,7 @@
 #[cfg(target_os = "linux")]
 mod imp {
     use std::io;
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
     pub struct Signals(OwnedFd);
 
@@ -19,12 +19,12 @@ mod imp {
 
         /// Whether SIGINT or SIGTERM has arrived since the last call.
         pub fn pending(&self) -> bool {
-            crate::sys::signal_pending(&self.0)
+            crate::sys::signal_pending(self.0.as_fd())
         }
 
-        /// The descriptor, so the sandbox can cap descriptors above it.
-        pub fn raw_fd(&self) -> i32 {
-            self.0.as_raw_fd()
+        /// The signalfd, for the sandbox's descriptor cap.
+        pub fn fd(&self) -> Option<RawFd> {
+            Some(self.0.as_raw_fd())
         }
     }
 }
@@ -32,6 +32,7 @@ mod imp {
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use std::io;
+    use std::os::fd::RawFd;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -50,8 +51,9 @@ mod imp {
             self.0.load(Ordering::Relaxed)
         }
 
-        pub fn raw_fd(&self) -> i32 {
-            -1
+        /// No descriptor: signals arrive through a handler here.
+        pub fn fd(&self) -> Option<RawFd> {
+            None
         }
     }
 }

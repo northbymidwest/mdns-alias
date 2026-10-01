@@ -3,14 +3,17 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
-use mdns_alias::responder::Conflict;
-use mdns_alias::signals::Signals;
-use mdns_alias::wire::Name;
-use mdns_alias::{netlink, sandbox, sys};
+use mdns_alias::testing::responder::Conflict;
+use mdns_alias::testing::sandbox::Layer;
+use mdns_alias::testing::signals::Signals;
+use mdns_alias::testing::wire::Name;
+use mdns_alias::testing::{netlink, sandbox, sys};
 use socket_pktinfo::PktInfoUdpSocket;
 use socket2::{Domain, SockAddr};
 
@@ -18,8 +21,9 @@ use socket2::{Domain, SockAddr};
 fn signalfd_reports_a_blocked_sigterm_once() {
     let signals = Signals::new().unwrap();
     assert!(!signals.pending());
-    // raise() targets this thread, which Signals::new has just blocked
-    // SIGTERM for, so it queues on the signalfd instead of killing us.
+    // SAFETY: raise() takes an integer and touches no memory. It targets
+    // this thread, which Signals::new has just blocked SIGTERM for, so it
+    // queues on the signalfd instead of killing us.
     unsafe { libc::raise(libc::SIGTERM) };
     assert!(signals.pending());
     assert!(!signals.pending());
@@ -27,9 +31,16 @@ fn signalfd_reports_a_blocked_sigterm_once() {
 
 const CHILD: &str = "MDNS_ALIAS_TEST_CHILD";
 
+/// Exits at once with `code`, running nothing else: for sandboxed test
+/// children, which could not flush or report anyway.
+fn exit_now(code: i32) -> ! {
+    // SAFETY: _exit takes an integer and never returns.
+    unsafe { libc::_exit(code) }
+}
+
 /// Runs `test` again, alone, in a child process, and returns how it ended.
 /// Inside that child it returns `None` instead: the test body then does the
-/// sandboxed part and ends with `sys::exit_now`, since once sandboxed the
+/// sandboxed part and ends with `exit_now`, since once sandboxed the
 /// test harness could not report anything itself.
 fn in_child_with(test: &str, configure: impl FnOnce(&mut Command)) -> Option<ExitStatus> {
     if std::env::var_os(CHILD).is_some() {
@@ -56,7 +67,7 @@ fn in_child(test: &str) -> Option<ExitStatus> {
 
 fn seccomp() {
     sys::set_no_new_privs().unwrap();
-    sys::install_seccomp(&sandbox::program(sys::thread_id())).unwrap();
+    sys::install_seccomp(&sandbox::program(sys::thread_id()).unwrap()).unwrap();
 }
 
 fn assert_killed(status: ExitStatus) {
@@ -94,6 +105,8 @@ fn seccomp_allows_the_steady_state() {
         let mut buf = [0u8; 16];
         let got = receiver.recv(&mut buf).map_or(0, |(n, _)| n);
         let _ = sender.send_to(b"x", (Ipv4Addr::BROADCAST, 9));
+        // Waiting out a failed receive.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let quiet = !signals.pending();
         let buffer = vec![1u8; 1 << 20];
         std::hint::black_box(&buffer);
@@ -107,7 +120,7 @@ fn seccomp_allows_the_steady_state() {
         std::hint::black_box(&grow);
         drop(grow);
         eprintln!("sandboxed child: rescanned {rescanned}, received {got}");
-        sys::exit_now(if rescanned && got == 4 && quiet { 0 } else { 3 });
+        exit_now(if rescanned && got == 4 && quiet { 0 } else { 3 });
     };
     assert!(status.success(), "{status:?}");
 }
@@ -144,12 +157,12 @@ fn highest_fd() -> i32 {
 #[test]
 fn full_lockdown_still_rescans() {
     let Some(status) = in_child("full_lockdown_still_rescans") else {
-        let report = sandbox::lock(highest_fd());
-        let sealed = report.applied.iter().any(|a| a == "seccomp");
+        let report = sandbox::lock([highest_fd()]);
+        let sealed = report.applied(Layer::Seccomp);
         // Twice: the descriptor cap must leave room for the netlink socket
         // on every rescan, not just the first.
         let rescans = netlink::dump().is_ok() && netlink::dump().is_ok();
-        sys::exit_now(if sealed && rescans { 0 } else { 3 });
+        exit_now(if sealed && rescans { 0 } else { 3 });
     };
     assert!(status.success(), "{status:?}");
 }
@@ -170,6 +183,8 @@ fn seccomp_lets_a_panic_report_itself() {
     let Some(status) = in_child_with("seccomp_lets_a_panic_report_itself", |c| {
         c.stderr(std::fs::File::create(&log).unwrap());
     }) else {
+        // For the parent: the id the hook must print without a gettid call.
+        eprintln!("tid {}", sys::thread_id());
         seccomp();
         // What panic = "abort" (the release profile) does: run the default
         // hook, then abort. Tests build with unwinding, so the harness would
@@ -179,10 +194,14 @@ fn seccomp_lets_a_panic_report_itself() {
     };
     let text = std::fs::read_to_string(&log).unwrap();
     std::fs::remove_file(&log).unwrap();
-    // The hook prints the message, then abort() raises SIGABRT: neither
-    // step may be killed by the filter first.
+    // The hook prints the thread id and the message, then abort() raises
+    // SIGABRT: neither step may be killed by the filter first.
+    let tid = text
+        .lines()
+        .find_map(|l| l.strip_prefix("tid "))
+        .unwrap_or_else(|| panic!("{text}"));
     assert!(
-        text.contains("panicked at") && text.contains("sandboxed boom"),
+        text.contains(&format!("({tid}) panicked at")) && text.contains("sandboxed boom"),
         "{text}"
     );
     assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
@@ -193,7 +212,7 @@ fn seccomp_kills_file_access() {
     let Some(status) = in_child("seccomp_kills_file_access") else {
         seccomp();
         let _ = std::fs::File::open("/proc/self/status");
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert_killed(status);
 }
@@ -203,7 +222,7 @@ fn seccomp_kills_new_ip_sockets() {
     let Some(status) = in_child("seccomp_kills_new_ip_sockets") else {
         seccomp();
         let _ = std::net::UdpSocket::bind(("127.0.0.1", 0));
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert_killed(status);
 }
@@ -215,7 +234,7 @@ fn seccomp_kills_fork() {
         // SAFETY: the call is expected to kill the process; if it returned,
         // the child would exit at once without touching shared state.
         unsafe { libc::fork() };
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert_killed(status);
 }
@@ -233,7 +252,7 @@ fn seccomp_kills_execve() {
         // SAFETY: valid NUL-terminated path, argv and envp arrays; the call
         // is expected to kill the process.
         unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert_killed(status);
 }
@@ -254,7 +273,7 @@ fn seccomp_kills_executable_memory() {
                 0,
             )
         };
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert_killed(status);
 }
@@ -266,7 +285,7 @@ fn seccomp_kills_writes_to_stdout() {
         use std::io::Write;
         let _ = std::io::stdout().write_all(b"x\n");
         let _ = std::io::stdout().flush();
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert_killed(status);
 }
@@ -276,14 +295,14 @@ fn landlock_denies_files_and_tcp() {
     let Some(status) = in_child("landlock_denies_files_and_tcp") else {
         let exe = std::env::current_exe().unwrap();
         let Ok(abi) = sys::landlock_abi() else {
-            sys::exit_now(77)
+            exit_now(77)
         };
         sys::set_no_new_privs().unwrap();
         sys::landlock_restrict(&sandbox::landlock_ruleset(abi)).unwrap();
         let denied = |e: std::io::Error| e.kind() == std::io::ErrorKind::PermissionDenied;
         let file = std::fs::File::open(&exe).is_err_and(denied);
         let tcp = abi < 4 || std::net::TcpStream::connect(("127.0.0.1", 9)).is_err_and(denied);
-        sys::exit_now(match (file, tcp) {
+        exit_now(match (file, tcp) {
             (true, true) => 0,
             (false, _) => 2,
             (_, false) => 3,
@@ -304,11 +323,11 @@ fn logging_to_a_file_survives_the_full_lockdown() {
     let Some(status) = in_child_with("logging_to_a_file_survives_the_full_lockdown", |c| {
         c.stderr(std::fs::File::create(&log).unwrap());
     }) else {
-        let report = sandbox::lock(2);
+        let report = sandbox::lock([]);
         for line in report.lines() {
             eprintln!("{line}");
         }
-        sys::exit_now(0);
+        exit_now(0);
     };
     let text = std::fs::read_to_string(&log).unwrap();
     std::fs::remove_file(&log).unwrap();
@@ -330,18 +349,18 @@ fn logging_to_a_file_survives_the_full_lockdown() {
 #[test]
 fn without_proc_only_the_address_space_limit_is_lost() {
     let Some(status) = in_child("without_proc_only_the_address_space_limit_is_lost") else {
-        let report = sandbox::lock_with(2, Err(std::io::ErrorKind::NotFound.into()));
-        let applied = |layer: &str| report.applied.iter().any(|a| a == layer);
-        let others = ["rlimits", "non-dumpable", "no-new-privs", "seccomp"];
-        let lost = |prefix: &str| report.missing.iter().any(|m| m.starts_with(prefix));
-        let only = report.missing.iter().all(|m| {
-            m.starts_with("address-space limit unavailable")
-                || m.starts_with("landlock unavailable")
+        let report = sandbox::lock_with([], Err(std::io::ErrorKind::NotFound.into()));
+        let lost = report
+            .missing(Layer::AddressSpace)
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        // Every other layer applied; Landlock may be missing instead, on
+        // kernels without it.
+        let others = Layer::ALL.into_iter().all(|layer| match layer {
+            Layer::AddressSpace => !report.applied(layer),
+            Layer::Landlock => report.applied(layer) != report.missing(layer).is_some(),
+            _ => report.applied(layer),
         });
-        let ok = others.iter().all(|layer| applied(layer))
-            && lost("address-space limit unavailable")
-            && only;
-        sys::exit_now(if ok { 0 } else { 4 });
+        exit_now(if lost && others { 0 } else { 4 });
     };
     assert!(status.success(), "{status:?}");
 }
@@ -353,7 +372,7 @@ fn draining_notifications_is_allowed_under_seccomp() {
         let mut buf = vec![0u8; 8192];
         seccomp();
         let _ = netlink::drain(&sock, &mut buf);
-        sys::exit_now(0);
+        exit_now(0);
     };
     assert!(status.success(), "{status:?}");
 }
@@ -388,13 +407,27 @@ fn address_changes_arrive_as_notifications() {
     assert!(changed, "no notification for the new address");
 }
 
+/// The local address of netlink socket `fd` as `(port id, group mask)`, from
+/// getsockname: an unbound socket reports port 0.
+fn netlink_local_address(fd: BorrowedFd<'_>) -> io::Result<(u32, u32)> {
+    // SAFETY: an all-zero sockaddr_nl is valid.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: getsockname writes at most `len` bytes into a live local of
+    // exactly that size, and updates `len`.
+    let ret = unsafe { libc::getsockname(fd.as_raw_fd(), (&raw mut addr).cast(), &raw mut len) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((addr.nl_pid, addr.nl_groups))
+}
+
 #[test]
 fn the_notification_socket_is_bound_and_subscribed() {
     // Unprivileged, so CI runs it: an unbound socket has port 0 and, since
     // Bind replaces the group mask, a bind after subscribing would clear it.
-    use std::os::fd::AsRawFd;
     let sock = netlink::subscribe().unwrap();
-    let (pid, groups) = sys::netlink_local_address(sock.as_raw_fd()).unwrap();
+    let (pid, groups) = netlink_local_address(sock.as_fd()).unwrap();
     let bit = |group: u32| 1u32 << (group - 1);
     let want = bit(netlink::RTNLGRP_LINK)
         | bit(netlink::RTNLGRP_IPV4_IFADDR)

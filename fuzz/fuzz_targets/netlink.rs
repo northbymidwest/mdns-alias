@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mdns_alias::netlink;
+use mdns_alias::testing::netlink;
 
 fuzz_target!(|data: &[u8]| {
     let _ = netlink::messages(data, &mut |_, payload| {

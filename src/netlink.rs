@@ -2,17 +2,28 @@
 //! dump and one address dump per rescan. On Linux this replaces
 //! getifaddrs, whose musl version also opens a Unix socket and issues an
 //! ioctl for every address; the sandbox allows neither. Parsing is pure and
-//! tested everywhere; only the socket is Linux-specific.
+//! tested everywhere; only the socket is Linux-specific, and elsewhere only
+//! tests use what the socket code needs.
+
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux code uses these outside tests; Linux CI lints this module in full"
+    )
+)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::net::IfIndex;
+
 /// Message types: the dump requests `request` builds, and the replies.
-pub const RTM_NEWLINK: u16 = 16;
-pub const RTM_DELLINK: u16 = 17;
-pub const RTM_GETLINK: u16 = 18;
-pub const RTM_NEWADDR: u16 = 20;
-pub const RTM_DELADDR: u16 = 21;
-pub const RTM_GETADDR: u16 = 22;
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
+const RTM_GETADDR: u16 = 22;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 0x1;
@@ -28,10 +39,10 @@ const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_FLAGS: u16 = 8;
 /// IPv6 address states that make an address unfit to publish.
-pub const IFA_F_TEMPORARY: u32 = 0x01;
-pub const IFA_F_DADFAILED: u32 = 0x08;
-pub const IFA_F_DEPRECATED: u32 = 0x20;
-pub const IFA_F_TENTATIVE: u32 = 0x40;
+const IFA_F_TEMPORARY: u32 = 0x01;
+const IFA_F_DADFAILED: u32 = 0x08;
+const IFA_F_DEPRECATED: u32 = 0x20;
+const IFA_F_TENTATIVE: u32 = 0x40;
 /// Notification groups: links, IPv4 addresses, IPv6 addresses.
 pub const RTNLGRP_LINK: u32 = 1;
 pub const RTNLGRP_IPV4_IFADDR: u32 = 5;
@@ -41,23 +52,24 @@ const AF_INET6: u8 = 10;
 
 pub const IFF_UP: u32 = 0x1;
 pub const IFF_LOOPBACK: u32 = 0x8;
+#[cfg(target_os = "linux")]
 pub const IFF_POINTOPOINT: u32 = 0x10;
 pub const IFF_RUNNING: u32 = 0x40;
 pub const IFF_MULTICAST: u32 = 0x1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkInfo {
-    pub index: u32,
+    pub index: IfIndex,
     pub flags: u32,
     pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddrInfo {
-    pub index: u32,
+    pub index: IfIndex,
     pub addr: IpAddr,
     pub prefix: u8,
-    pub flags: u32,
+    flags: u32,
 }
 
 impl AddrInfo {
@@ -81,13 +93,19 @@ impl AddrInfo {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Malformed;
 
-/// A dump request for `rtype` (RTM_GETLINK or RTM_GETADDR) across every
-/// address family.
-pub fn request(rtype: u16, seq: u32) -> Vec<u8> {
-    let body = if rtype == RTM_GETLINK {
-        IFINFOMSG
-    } else {
-        IFADDRMSG
+/// What a dump request asks for.
+#[derive(Clone, Copy, Debug)]
+enum Dump {
+    Links,
+    Addresses,
+}
+
+/// A dump request for every link or every address, across every address
+/// family.
+fn request(dump: Dump, seq: u32) -> Vec<u8> {
+    let (rtype, body) = match dump {
+        Dump::Links => (RTM_GETLINK, IFINFOMSG),
+        Dump::Addresses => (RTM_GETADDR, IFADDRMSG),
     };
     let len = HEADER + body;
     let mut out = vec![0u8; len];
@@ -149,9 +167,10 @@ fn attributes(mut b: &[u8], mut each: impl FnMut(u16, &[u8])) {
     }
 }
 
-/// An RTM_NEWLINK payload. `None` if it is too short or has no name.
+/// An RTM_NEWLINK payload. `None` if it is too short, has no name, or
+/// has index 0.
 pub fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
-    let index = u32_at(payload, 4)?;
+    let index = IfIndex::new(u32_at(payload, 4)?)?;
     let flags = u32_at(payload, 8)?;
     let mut name = None;
     attributes(payload.get(IFINFOMSG..)?, |kind, value| {
@@ -168,11 +187,12 @@ pub fn parse_link(payload: &[u8]) -> Option<LinkInfo> {
 }
 
 /// An RTM_NEWADDR payload. IPv4 prefers IFA_LOCAL: on point-to-point links
-/// IFA_ADDRESS is the peer's address.
+/// IFA_ADDRESS is the peer's address. `None` without an address, or for
+/// index 0.
 pub fn parse_addr(payload: &[u8]) -> Option<AddrInfo> {
     let family = *payload.first()?;
     let prefix = *payload.get(1)?;
-    let index = u32_at(payload, 4)?;
+    let index = IfIndex::new(u32_at(payload, 4)?)?;
     let mut flags = u32::from(*payload.get(2)?);
     let (mut address, mut local) = (None, None);
     attributes(payload.get(IFADDRMSG..)?, |kind, value| {
@@ -206,7 +226,7 @@ pub fn parse_addr(payload: &[u8]) -> Option<AddrInfo> {
 }
 
 /// Whether a notification of `kind` may have changed links or addresses.
-pub fn is_change(kind: u16) -> bool {
+fn is_change(kind: u16) -> bool {
     matches!(kind, RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR)
 }
 
@@ -223,7 +243,7 @@ pub struct Drained {
 /// Subscribing is only possible before lockdown.
 #[cfg(target_os = "linux")]
 pub fn subscribe() -> std::io::Result<socket2::Socket> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
 
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -232,9 +252,9 @@ pub fn subscribe() -> std::io::Result<socket2::Socket> {
         Type::RAW,
         Some(Protocol::from(libc::NETLINK_ROUTE)),
     )?;
-    crate::sys::netlink_bind(sock.as_raw_fd())?;
+    crate::sys::netlink_bind(sock.as_fd())?;
     for group in [RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV6_IFADDR] {
-        crate::sys::netlink_subscribe(sock.as_raw_fd(), group)?;
+        crate::sys::netlink_subscribe(sock.as_fd(), group)?;
     }
     sock.set_nonblocking(true)?;
     Ok(sock)
@@ -287,8 +307,8 @@ pub fn dump() -> std::io::Result<(Vec<LinkInfo>, Vec<AddrInfo>)> {
     // The kernel sizes dump datagrams to the reader's buffer, up to 32 KiB.
     let mut buf = vec![0u8; 32 * 1024];
     let (mut links, mut addrs) = (Vec::new(), Vec::new());
-    for (seq, rtype) in [(1, RTM_GETLINK), (2, RTM_GETADDR)] {
-        sock.send(&request(rtype, seq))?;
+    for (seq, dump) in [(1, Dump::Links), (2, Dump::Addresses)] {
+        sock.send(&request(dump, seq))?;
         loop {
             let n = (&sock).read(&mut buf)?;
             if n == 0 {
@@ -367,7 +387,7 @@ mod tests {
 
     #[test]
     fn requests_dump_every_family() {
-        let link = request(RTM_GETLINK, 7);
+        let link = request(Dump::Links, 7);
         assert_eq!(link.len(), HEADER + IFINFOMSG);
         assert_eq!(u32::from_ne_bytes(link[0..4].try_into().unwrap()), 32);
         assert_eq!(
@@ -377,7 +397,12 @@ mod tests {
         assert_eq!(u16::from_ne_bytes(link[6..8].try_into().unwrap()), 0x301);
         assert_eq!(u32::from_ne_bytes(link[8..12].try_into().unwrap()), 7);
         assert!(link[12..].iter().all(|&b| b == 0));
-        assert_eq!(request(RTM_GETADDR, 8).len(), HEADER + IFADDRMSG);
+        let addr = request(Dump::Addresses, 8);
+        assert_eq!(addr.len(), HEADER + IFADDRMSG);
+        assert_eq!(
+            u16::from_ne_bytes(addr[4..6].try_into().unwrap()),
+            RTM_GETADDR
+        );
     }
 
     #[test]
@@ -393,12 +418,12 @@ mod tests {
             links,
             [
                 LinkInfo {
-                    index: 2,
+                    index: IfIndex::of(2),
                     flags: UP,
                     name: "enp1s0".into()
                 },
                 LinkInfo {
-                    index: 1,
+                    index: IfIndex::of(1),
                     flags: IFF_UP | IFF_LOOPBACK,
                     name: "lo".into()
                 },
@@ -422,7 +447,7 @@ mod tests {
         assert_eq!(
             addrs,
             [AddrInfo {
-                index: 2,
+                index: IfIndex::of(2),
                 addr: "192.0.2.10".parse().unwrap(),
                 prefix: 24,
                 flags: 0,
@@ -454,7 +479,7 @@ mod tests {
         assert_eq!(
             collect(&buf).2,
             [AddrInfo {
-                index: 2,
+                index: IfIndex::of(2),
                 addr: IpAddr::V6(ip),
                 prefix: 64,
                 flags: 0,
@@ -494,13 +519,24 @@ mod tests {
     #[test]
     fn short_or_nameless_payloads_yield_nothing() {
         assert_eq!(parse_link(&[0; 8]), None);
-        assert_eq!(parse_link(&[0; IFINFOMSG]), None);
+        let mut nameless = vec![0u8; IFINFOMSG];
+        nameless[4..8].copy_from_slice(&2u32.to_ne_bytes());
+        assert_eq!(parse_link(&nameless), None);
         assert_eq!(parse_addr(&[AF_INET, 24]), None);
-        let mut overrun = vec![0u8; IFINFOMSG];
+        let mut overrun = nameless;
         overrun.extend(200u16.to_ne_bytes());
         overrun.extend(IFLA_IFNAME.to_ne_bytes());
         overrun.extend(b"lo\0\0");
         assert_eq!(parse_link(&overrun), None);
+    }
+
+    #[test]
+    fn index_zero_is_no_interface() {
+        assert_eq!(collect(&link(0, UP, &[], "enp1s0")).1, []);
+        assert_eq!(
+            collect(&addr(AF_INET, 24, 0, &[(IFA_LOCAL, &[192, 0, 2, 10])])).2,
+            []
+        );
     }
 
     fn addr_with_flags(family: u8, flags_byte: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
