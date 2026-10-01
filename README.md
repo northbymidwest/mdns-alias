@@ -28,12 +28,12 @@ the CNAME to the target's addresses.
 ## Docker
 
 Released images are at `ghcr.io/northbymidwest/mdns-alias:<version>`, for
-`linux/amd64` and `linux/arm64`. The current release is `0.2.0`. `latest`
+`linux/amd64` and `linux/arm64`. The current release is `0.3.0`. `latest`
 follows the newest release; pin a version (or a digest) for anything you
 deploy. Each release carries build provenance and SBOM attestations:
 
 ```sh
-gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.2.0 \
+gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.3.0 \
   --owner northbymidwest
 ```
 
@@ -45,7 +45,7 @@ the default target is right.
 ```yaml
 services:
   mdns-alias:
-    image: ghcr.io/northbymidwest/mdns-alias:0.2.0
+    image: ghcr.io/northbymidwest/mdns-alias:0.3.0
     network_mode: host
     command: ["app.myhost.local"]
     read_only: true
