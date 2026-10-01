@@ -345,3 +345,60 @@ fn without_proc_only_the_address_space_limit_is_lost() {
     };
     assert!(status.success(), "{status:?}");
 }
+
+#[test]
+fn draining_notifications_is_allowed_under_seccomp() {
+    let Some(status) = in_child("draining_notifications_is_allowed_under_seccomp") else {
+        let sock = netlink::subscribe().unwrap();
+        let mut buf = vec![0u8; 8192];
+        seccomp();
+        let _ = netlink::drain(&sock, &mut buf);
+        sys::exit_now(0);
+    };
+    assert!(status.success(), "{status:?}");
+}
+
+#[test]
+fn address_changes_arrive_as_notifications() {
+    // Needs CAP_NET_ADMIN (the deployment host's test container has it; CI
+    // runners do not). Only ever touches loopback in the test's own network
+    // namespace.
+    let sock = netlink::subscribe().unwrap();
+    let ip = |verb: &str| {
+        Command::new("ip")
+            .args(["addr", verb, "127.0.0.2/8", "dev", "lo"])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !ip("add") {
+        eprintln!("cannot add an address here (needs CAP_NET_ADMIN); skipped");
+        return;
+    }
+    let mut buf = vec![0u8; 8192];
+    let mut changed = false;
+    for _ in 0..50 {
+        if netlink::drain(&sock, &mut buf).changed {
+            changed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    ip("del");
+    assert!(changed, "no notification for the new address");
+}
+
+#[test]
+fn the_notification_socket_is_bound_and_subscribed() {
+    // Unprivileged, so CI runs it: an unbound socket has port 0 and, since
+    // Bind replaces the group mask, a bind after subscribing would clear it.
+    use std::os::fd::AsRawFd;
+    let sock = netlink::subscribe().unwrap();
+    let (pid, groups) = sys::netlink_local_address(sock.as_raw_fd()).unwrap();
+    let bit = |group: u32| 1u32 << (group - 1);
+    let want = bit(netlink::RTNLGRP_LINK)
+        | bit(netlink::RTNLGRP_IPV4_IFADDR)
+        | bit(netlink::RTNLGRP_IPV6_IFADDR);
+    assert_ne!(pid, 0, "socket is not bound");
+    assert_eq!(groups, want, "group mask {groups:#x}");
+}

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Asks for NAME over mDNS from an ephemeral port, a legacy unicast query
-(RFC 6762 section 6.7), and exits 0 if the reply holds a CNAME answer.
+"""Asks for NAME's A records over mDNS from an ephemeral port, a legacy
+unicast query (RFC 6762 section 6.7), and exits 0 if the reply's answers
+include a record of type EXPECT (A, the default, or CNAME).
 
-    scripts/mdns-query.py NAME
+    scripts/mdns-query.py NAME [A|CNAME]
 """
 import socket
 import struct
 import sys
 
 name = sys.argv[1]
+expect = {"A": 1, "CNAME": 5}[sys.argv[2] if len(sys.argv) > 2 else "A"]
+
 query = struct.pack(">HHHHHH", 0x1234, 0, 1, 0, 0, 0)
 for label in name.rstrip(".").split("."):
     query += bytes([len(label)]) + label.encode()
@@ -18,9 +21,37 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
 sock.settimeout(3)
 sock.sendto(query, ("224.0.0.251", 5353))
-reply, _ = sock.recvfrom(9000)
-ident, _, _, answers = struct.unpack(">HHHH", reply[:8])
-# A legacy reply echoes the ID and carries the CNAME (type 5, class IN).
-ok = ident == 0x1234 and answers >= 1 and b"\x00\x05\x00\x01" in reply
-print("CNAME answer received" if ok else "no CNAME in reply")
+try:
+    reply, _ = sock.recvfrom(9000)
+except socket.timeout:
+    print("no reply within 3 s")
+    sys.exit(1)
+
+
+def skip_name(b, i):
+    while True:
+        n = b[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += 1 + n
+
+
+try:
+    ident, _, questions, answers = struct.unpack(">HHHH", reply[:8])
+    i = 12
+    for _ in range(questions):
+        i = skip_name(reply, i) + 4
+    types = []
+    for _ in range(answers):
+        i = skip_name(reply, i)
+        rtype, _, _, length = struct.unpack(">HHIH", reply[i : i + 10])
+        types.append(rtype)
+        i += 10 + length
+except (IndexError, struct.error):
+    print("truncated or malformed reply (%d bytes)" % len(reply))
+    sys.exit(1)
+ok = ident == 0x1234 and expect in types
+print("answer types %s, expected %d" % (types, expect))
 sys.exit(0 if ok else 1)

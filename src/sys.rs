@@ -225,3 +225,53 @@ pub fn exit_now(code: i32) -> ! {
     // SAFETY: _exit takes an integer and never returns.
     unsafe { libc::_exit(code) }
 }
+
+/// Binds netlink socket `fd` to an automatically chosen port and no groups.
+/// The kernel delivers multicast notifications only to bound sockets (an
+/// unbound one has port 0, the kernel's own sender port, and is skipped).
+/// Bind replaces the socket's whole group mask, so this must come before
+/// `netlink_subscribe`, never after. Only before lockdown: the seccomp
+/// filter allows no bind.
+pub fn netlink_bind(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: an all-zero sockaddr_nl is valid (port 0 picks one, no groups).
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: bind reads size_of::<sockaddr_nl>() bytes from a live local.
+    check(unsafe {
+        libc::bind(
+            fd,
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    })
+    .map(drop)
+}
+
+/// Subscribes netlink socket `fd` to notification group `group` (an
+/// RTNLGRP_* number). Only before lockdown: the seccomp filter allows no
+/// netlink socket options.
+pub fn netlink_subscribe(fd: std::os::fd::RawFd, group: u32) -> io::Result<()> {
+    // SAFETY: setsockopt reads size_of::<u32>() bytes from a live local.
+    check(unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_NETLINK,
+            libc::NETLINK_ADD_MEMBERSHIP,
+            (&raw const group).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    })
+    .map(drop)
+}
+
+/// The local address of netlink socket `fd` as `(port id, group mask)`, from
+/// getsockname. For tests and diagnostics: an unbound socket reports port 0.
+pub fn netlink_local_address(fd: std::os::fd::RawFd) -> io::Result<(u32, u32)> {
+    // SAFETY: an all-zero sockaddr_nl is valid.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: getsockname writes at most `len` bytes into a live local of
+    // exactly that size, and updates `len`.
+    check(unsafe { libc::getsockname(fd, (&raw mut addr).cast(), &raw mut len) })?;
+    Ok((addr.nl_pid, addr.nl_groups))
+}

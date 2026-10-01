@@ -8,8 +8,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Message types: the dump requests `request` builds, and the replies.
 pub const RTM_NEWLINK: u16 = 16;
+pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -24,6 +26,16 @@ const IFADDRMSG: usize = 8;
 const IFLA_IFNAME: u16 = 3;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
+const IFA_FLAGS: u16 = 8;
+/// IPv6 address states that make an address unfit to publish.
+pub const IFA_F_TEMPORARY: u32 = 0x01;
+pub const IFA_F_DADFAILED: u32 = 0x08;
+pub const IFA_F_DEPRECATED: u32 = 0x20;
+pub const IFA_F_TENTATIVE: u32 = 0x40;
+/// Notification groups: links, IPv4 addresses, IPv6 addresses.
+pub const RTNLGRP_LINK: u32 = 1;
+pub const RTNLGRP_IPV4_IFADDR: u32 = 5;
+pub const RTNLGRP_IPV6_IFADDR: u32 = 9;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
@@ -45,6 +57,23 @@ pub struct AddrInfo {
     pub index: u32,
     pub addr: IpAddr,
     pub prefix: u8,
+    pub flags: u32,
+}
+
+impl AddrInfo {
+    /// Whether the address is settled and lasting enough to publish: every
+    /// IPv4 address, and IPv6 addresses that are not tentative, failed
+    /// duplicate detection, deprecated or temporary.
+    pub fn stable(&self) -> bool {
+        match self.addr {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(_) => {
+                self.flags
+                    & (IFA_F_TENTATIVE | IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TEMPORARY)
+                    == 0
+            }
+        }
+    }
 }
 
 /// A reply the kernel should never send: lengths that do not fit, or an
@@ -144,8 +173,15 @@ pub fn parse_addr(payload: &[u8]) -> Option<AddrInfo> {
     let family = *payload.first()?;
     let prefix = *payload.get(1)?;
     let index = u32_at(payload, 4)?;
+    let mut flags = u32::from(*payload.get(2)?);
     let (mut address, mut local) = (None, None);
     attributes(payload.get(IFADDRMSG..)?, |kind, value| {
+        if kind == IFA_FLAGS {
+            if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                flags = u32::from_ne_bytes(bytes);
+            }
+            return;
+        }
         let ip = match (family, value.len()) {
             (AF_INET, 4) => IpAddr::V4(Ipv4Addr::new(value[0], value[1], value[2], value[3])),
             (AF_INET6, 16) => {
@@ -165,7 +201,73 @@ pub fn parse_addr(payload: &[u8]) -> Option<AddrInfo> {
         index,
         addr: local.or(address)?,
         prefix,
+        flags,
     })
+}
+
+/// Whether a notification of `kind` may have changed links or addresses.
+pub fn is_change(kind: u16) -> bool {
+    matches!(kind, RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR)
+}
+
+/// What draining the notification socket found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Drained {
+    /// A link or address changed: rescan once things settle.
+    pub changed: bool,
+    /// The kernel dropped notifications: rescan now.
+    pub overflow: bool,
+}
+
+/// A non-blocking socket subscribed to link and address notifications.
+/// Subscribing is only possible before lockdown.
+#[cfg(target_os = "linux")]
+pub fn subscribe() -> std::io::Result<socket2::Socket> {
+    use std::os::fd::AsRawFd;
+
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock = Socket::new(
+        Domain::from(libc::AF_NETLINK),
+        Type::RAW,
+        Some(Protocol::from(libc::NETLINK_ROUTE)),
+    )?;
+    crate::sys::netlink_bind(sock.as_raw_fd())?;
+    for group in [RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV6_IFADDR] {
+        crate::sys::netlink_subscribe(sock.as_raw_fd(), group)?;
+    }
+    sock.set_nonblocking(true)?;
+    Ok(sock)
+}
+
+/// Reads every pending notification from `sock` without blocking.
+/// Anything unreadable counts as a change: a needless rescan is cheap, a
+/// missed change is not.
+#[cfg(target_os = "linux")]
+pub fn drain(sock: &socket2::Socket, buf: &mut [u8]) -> Drained {
+    use std::io::{ErrorKind, Read};
+
+    let mut drained = Drained::default();
+    let mut reader = sock;
+    loop {
+        match reader.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let parsed = messages(&buf[..n], &mut |kind, _| drained.changed |= is_change(kind));
+                if parsed.is_err() {
+                    drained.changed = true;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => drained.overflow = true,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => {
+                drained.changed = true;
+                break;
+            }
+        }
+    }
+    drained
 }
 
 /// Every link and every address, straight from the kernel. The socket is
@@ -322,7 +424,8 @@ mod tests {
             [AddrInfo {
                 index: 2,
                 addr: "192.0.2.10".parse().unwrap(),
-                prefix: 24
+                prefix: 24,
+                flags: 0,
             }]
         );
     }
@@ -353,7 +456,8 @@ mod tests {
             [AddrInfo {
                 index: 2,
                 addr: IpAddr::V6(ip),
-                prefix: 64
+                prefix: 64,
+                flags: 0,
             }]
         );
     }
@@ -397,5 +501,67 @@ mod tests {
         overrun.extend(IFLA_IFNAME.to_ne_bytes());
         overrun.extend(b"lo\0\0");
         assert_eq!(parse_link(&overrun), None);
+    }
+
+    fn addr_with_flags(family: u8, flags_byte: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut payload = vec![family, 64, flags_byte, 0];
+        payload.extend(2u32.to_ne_bytes());
+        for (kind, value) in attrs {
+            payload.extend(attribute(*kind, value));
+        }
+        message(RTM_NEWADDR, &payload)
+    }
+
+    fn only_addr(buf: &[u8]) -> AddrInfo {
+        let (_, _, addrs) = collect(buf);
+        addrs.into_iter().next().expect("one address")
+    }
+
+    #[test]
+    fn address_flags_come_from_the_attribute_or_the_byte() {
+        let ip = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        let from_byte = addr_with_flags(AF_INET6, IFA_F_DEPRECATED as u8, &[(IFA_ADDRESS, &ip)]);
+        assert_eq!(only_addr(&from_byte).flags, IFA_F_DEPRECATED);
+        let wide = IFA_F_TEMPORARY.to_ne_bytes();
+        let from_attr = addr_with_flags(AF_INET6, 0, &[(IFA_ADDRESS, &ip), (IFA_FLAGS, &wide)]);
+        assert_eq!(only_addr(&from_attr).flags, IFA_F_TEMPORARY);
+    }
+
+    #[test]
+    fn only_settled_lasting_ipv6_addresses_are_stable() {
+        let ip = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        for (flags, stable) in [
+            (0, true),
+            (IFA_F_TENTATIVE, false),
+            (IFA_F_DADFAILED, false),
+            (IFA_F_DEPRECATED, false),
+            (IFA_F_TEMPORARY, false),
+        ] {
+            let buf = addr_with_flags(
+                AF_INET6,
+                0,
+                &[(IFA_ADDRESS, &ip), (IFA_FLAGS, &flags.to_ne_bytes())],
+            );
+            assert_eq!(only_addr(&buf).stable(), stable, "flags {flags:#x}");
+        }
+        let v4 = addr_with_flags(
+            AF_INET,
+            0,
+            &[
+                (IFA_ADDRESS, &[192, 0, 2, 10]),
+                (IFA_FLAGS, &IFA_F_TEMPORARY.to_ne_bytes()),
+            ],
+        );
+        assert!(only_addr(&v4).stable());
+    }
+
+    #[test]
+    fn link_and_address_notifications_are_changes() {
+        for kind in [RTM_NEWLINK, RTM_DELLINK, RTM_NEWADDR, RTM_DELADDR] {
+            assert!(is_change(kind), "{kind}");
+        }
+        for kind in [RTM_GETLINK, RTM_GETADDR, 24, NLMSG_DONE] {
+            assert!(!is_change(kind), "{kind}");
+        }
     }
 }

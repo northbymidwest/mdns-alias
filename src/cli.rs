@@ -1,30 +1,36 @@
-//! The command line, and the CNAME target it implies.
+//! The command line, and the host name it implies.
 
 use crate::wire::Name;
 
-pub const USAGE: &str = "usage: mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <name>...";
+pub const USAGE: &str = "usage: mdns-alias [--host <name.local>] [--cname] [--interface <name>]... [--require-sandbox] <name>...";
 
 #[derive(Debug, PartialEq)]
 pub struct Cli {
-    pub target: Option<Name>,
+    /// The base for relative names, and the CNAME target in `--cname` mode.
+    pub host: Option<Name>,
     /// `--interface` names; empty means the default set.
     pub interfaces: Vec<String>,
-    /// The names as given: relative to the target unless they end in
+    /// The names as given: relative to the host unless they end in
     /// `.local` (or a dot). `resolve` expands them.
     pub names: Vec<String>,
+    /// Publish CNAMEs of the host instead of address records.
+    pub cname: bool,
     /// Exit rather than run with any sandbox layer missing.
     pub require_sandbox: bool,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
-    let mut target = None;
+    let mut host = None;
     let mut interfaces = Vec::new();
     let mut names = Vec::new();
+    let mut cname = false;
     let mut require_sandbox = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--target" => target = Some(local_name(&args.next().ok_or(USAGE)?)?),
+            "--host" => host = Some(local_name(&args.next().ok_or(USAGE)?)?),
+            "--target" => return Err(format!("--target is now --host\n{USAGE}")),
+            "--cname" => cname = true,
             "--interface" => interfaces.push(args.next().ok_or(USAGE)?),
             "--require-sandbox" => require_sandbox = true,
             option if option.starts_with('-') => return Err(USAGE.into()),
@@ -35,49 +41,50 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         return Err(USAGE.into());
     }
     Ok(Cli {
-        target,
+        host,
         interfaces,
         names,
+        cname,
         require_sandbox,
     })
 }
 
-/// The target every alias points at, and the aliases, deduplicated ignoring
-/// case. The target is `--target`, or else this host's own `.local` name,
+/// The host every alias points at, and the aliases, deduplicated ignoring
+/// case. The host is `--host`, or else this host's own `.local` name,
 /// made from the first label of `hostname` (the kernel host name, when it
 /// could be read). Relative names are expanded under it.
 pub fn resolve(cli: &Cli, hostname: Option<&str>) -> Result<(Name, Vec<Name>), String> {
-    let target = match (&cli.target, hostname) {
-        (Some(target), _) => target.clone(),
-        (None, Some(host)) => {
-            let first = host.trim().split('.').next().unwrap_or_default();
+    let host_target = match (&cli.host, hostname) {
+        (Some(host), _) => host.clone(),
+        (None, Some(hostname_str)) => {
+            let first = hostname_str.trim().split('.').next().unwrap_or_default();
             Name::parse(&format!("{first}.local")).map_err(|_| {
                 format!(
-                    "cannot make a .local name from host name {host:?}; pass --target <name.local>"
+                    "cannot make a .local name from host name {hostname_str:?}; pass --host <name.local>"
                 )
             })?
         }
         (None, None) => {
-            return Err("cannot read this host's name; pass --target <name.local>".into());
+            return Err("cannot read this host's name; pass --host <name.local>".into());
         }
     };
     let mut aliases: Vec<Name> = Vec::new();
     for text in &cli.names {
-        let alias = alias(text, &target)?;
-        if alias == target {
-            return Err(format!("{alias} is the target itself"));
+        let alias = alias(text, &host_target)?;
+        if alias == host_target {
+            return Err(format!("{alias} is the host itself"));
         }
         if !aliases.contains(&alias) {
             aliases.push(alias);
         }
     }
-    Ok((target, aliases))
+    Ok((host_target, aliases))
 }
 
 /// `text` as a full name. Absolute if it ends in `.local`, or in a dot as
-/// in DNS; otherwise relative, under `target`: `seerr` is
-/// `seerr.<target>`.
-fn alias(text: &str, target: &Name) -> Result<Name, String> {
+/// in DNS; otherwise relative, under `host`: `seerr` is
+/// `seerr.<host>`.
+fn alias(text: &str, host: &Name) -> Result<Name, String> {
     if text.ends_with('.') {
         return local_name(text);
     }
@@ -85,8 +92,8 @@ fn alias(text: &str, target: &Name) -> Result<Name, String> {
     if name.is_local() {
         return Ok(name);
     }
-    name.under(target)
-        .map_err(|e| format!("invalid name {text:?} under {target}: {e}"))
+    name.under(host)
+        .map_err(|e| format!("invalid name {text:?} under {host}: {e}"))
 }
 
 fn local_name(text: &str) -> Result<Name, String> {
@@ -121,7 +128,7 @@ mod tests {
     #[test]
     fn parses_names_and_options() {
         let cli = parse(args(&[
-            "--target",
+            "--host",
             "myhost.local",
             "seerr",
             "--interface",
@@ -132,9 +139,10 @@ mod tests {
             "--require-sandbox",
         ]))
         .unwrap();
-        assert_eq!(cli.target, Some(name("myhost.local")));
+        assert_eq!(cli.host, Some(name("myhost.local")));
         assert_eq!(cli.interfaces, ["enp1s0", "wlo1"]);
         assert_eq!(cli.names, ["seerr", "app.other.local"]);
+        assert!(!cli.cname);
         assert!(cli.require_sandbox);
     }
 
@@ -142,7 +150,7 @@ mod tests {
     fn needs_at_least_one_name() {
         assert_eq!(parse(args(&[])), Err(USAGE.to_string()));
         assert_eq!(
-            parse(args(&["--target", "myhost.local"])),
+            parse(args(&["--host", "myhost.local"])),
             Err(USAGE.to_string())
         );
     }
@@ -150,7 +158,7 @@ mod tests {
     #[test]
     fn rejects_unknown_options_and_missing_values() {
         assert_eq!(parse(args(&["-v", "seerr"])), Err(USAGE.to_string()));
-        assert_eq!(parse(args(&["seerr", "--target"])), Err(USAGE.to_string()));
+        assert_eq!(parse(args(&["seerr", "--host"])), Err(USAGE.to_string()));
         assert_eq!(
             parse(args(&["seerr", "--interface"])),
             Err(USAGE.to_string())
@@ -168,17 +176,17 @@ mod tests {
     }
 
     #[test]
-    fn the_target_must_be_a_local_name() {
+    fn the_host_must_be_a_local_name() {
         assert_eq!(
-            parse(args(&["--target", "myhost", "seerr"])),
+            parse(args(&["--host", "myhost", "seerr"])),
             Err("myhost is not a .local name".to_string())
         );
     }
 
     #[test]
-    fn names_without_local_are_relative_to_the_target() {
-        let (target, aliases) = resolved(&["seerr", "api.seerr"]).unwrap();
-        assert_eq!(target, name("myhost.local"));
+    fn names_without_local_are_relative_to_the_host() {
+        let (host, aliases) = resolved(&["seerr", "api.seerr"]).unwrap();
+        assert_eq!(host, name("myhost.local"));
         assert_eq!(
             aliases,
             names(&["seerr.myhost.local", "api.seerr.myhost.local"])
@@ -195,9 +203,9 @@ mod tests {
     }
 
     #[test]
-    fn relative_names_follow_the_target_option() {
-        let (target, aliases) = resolved(&["--target", "nas.local", "files"]).unwrap();
-        assert_eq!(target, name("nas.local"));
+    fn relative_names_follow_the_host_option() {
+        let (host, aliases) = resolved(&["--host", "nas.local", "files"]).unwrap();
+        assert_eq!(host, name("nas.local"));
         assert_eq!(aliases, names(&["files.nas.local"]));
     }
 
@@ -247,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn target_defaults_to_the_host_name() {
+    fn host_defaults_to_the_host_name() {
         let cli = parse(args(&["seerr"])).unwrap();
         assert_eq!(
             resolve(&cli, Some("myhost.lan")).unwrap().0,
@@ -256,26 +264,40 @@ mod tests {
     }
 
     #[test]
-    fn target_needs_a_host_name_or_the_option() {
+    fn host_needs_a_host_name_or_the_option() {
         let cli = parse(args(&["seerr"])).unwrap();
         assert_eq!(
             resolve(&cli, None),
-            Err("cannot read this host's name; pass --target <name.local>".to_string())
+            Err("cannot read this host's name; pass --host <name.local>".to_string())
         );
         assert_eq!(
             resolve(&cli, Some("\n")),
             Err(
-                "cannot make a .local name from host name \"\\n\"; pass --target <name.local>"
+                "cannot make a .local name from host name \"\\n\"; pass --host <name.local>"
                     .to_string()
             )
         );
     }
 
     #[test]
-    fn an_alias_cannot_be_the_target() {
+    fn an_alias_cannot_be_the_host() {
         assert_eq!(
             resolved(&["MYHOST.local"]),
-            Err("MYHOST.local is the target itself".to_string())
+            Err("MYHOST.local is the host itself".to_string())
+        );
+    }
+
+    #[test]
+    fn cname_mode_is_off_unless_asked_for() {
+        assert!(!parse(args(&["seerr"])).unwrap().cname);
+        assert!(parse(args(&["--cname", "seerr"])).unwrap().cname);
+    }
+
+    #[test]
+    fn the_old_target_option_is_gone() {
+        assert_eq!(
+            parse(args(&["--target", "myhost.local", "seerr"])),
+            Err(format!("--target is now --host\n{USAGE}"))
         );
     }
 }

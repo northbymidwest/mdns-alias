@@ -8,6 +8,21 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Changed
+
+- Breaking: aliases are answered with this host's addresses (A, AAAA, and
+  NSEC for a missing family) on the interface each query arrives on, instead
+  of CNAMEs. `--cname` restores CNAMEs.
+- Breaking: `--target` is now `--host`.
+- On Linux, interface and address changes are picked up from kernel
+  notifications as they happen, with a full rescan every 5 minutes, instead
+  of every 30 seconds. Changed addresses are re-announced and removed ones
+  withdrawn.
+- Probes, announcements and replies that do not fit one packet are split
+  across several, so the alias count is no longer limited by packet size.
+
 ## 0.4.0 - 2026-09-30
 
 ### Changed

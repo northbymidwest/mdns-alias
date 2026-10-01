@@ -3,10 +3,12 @@
 //! 6762 section 18). Pure: no I/O.
 
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_CNAME: u16 = 5;
 pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_NSEC: u16 = 47;
 pub const TYPE_ANY: u16 = 255;
 pub const CLASS_IN: u16 = 1;
 pub const CLASS_ANY: u16 = 255;
@@ -145,8 +147,17 @@ pub struct Question {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RData {
+    A(Ipv4Addr),
+    Aaaa(Ipv6Addr),
     Cname(Name),
-    /// Any other type, as raw bytes.
+    /// NSEC (RFC 4034 section 4): in mDNS the next name is the owner itself,
+    /// and the types are those the owner has. Sorted, without duplicates.
+    Nsec {
+        next: Name,
+        types: Vec<u16>,
+    },
+    /// Any other type, or an address record of the wrong length, as raw
+    /// bytes.
     Other(Vec<u8>),
 }
 
@@ -166,7 +177,14 @@ impl Record {
     /// defined on.
     pub fn rdata_wire(&self) -> Vec<u8> {
         match &self.rdata {
+            RData::A(addr) => addr.octets().to_vec(),
+            RData::Aaaa(addr) => addr.octets().to_vec(),
             RData::Cname(name) => name.to_wire(),
+            RData::Nsec { next, types } => {
+                let mut out = next.to_wire();
+                out.extend(type_bitmap(types));
+                out
+            }
             RData::Other(bytes) => bytes.clone(),
         }
     }
@@ -254,16 +272,30 @@ impl Reader<'_> {
         let len = usize::from(self.u16()?);
         let start = self.pos;
         let raw = self.bytes(len)?.to_vec();
-        let rdata = if rtype == TYPE_CNAME {
-            // The target may use compression, so it is read from the whole
-            // packet, and must fill the rdata exactly.
-            let (target, end) = read_name(self.packet, start)?;
-            if end != start + len {
-                return None;
+        let rdata = match rtype {
+            TYPE_CNAME => {
+                // The target may use compression, so it is read from the
+                // whole packet, and must fill the rdata exactly.
+                let (target, end) = read_name(self.packet, start)?;
+                if end != start + len {
+                    return None;
+                }
+                RData::Cname(target)
             }
-            RData::Cname(target)
-        } else {
-            RData::Other(raw)
+            TYPE_A if len == 4 => RData::A(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
+            TYPE_AAAA if len == 16 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&raw);
+                RData::Aaaa(Ipv6Addr::from(octets))
+            }
+            TYPE_NSEC => {
+                // The next name may be compressed (RFC 6762 section 18.14);
+                // the type bitmap fills the rest of the rdata.
+                let (next, end) = read_name(self.packet, start)?;
+                let types = bitmap_types(self.packet.get(end..start + len)?)?;
+                RData::Nsec { next, types }
+            }
+            _ => RData::Other(raw),
         };
         Some(Record {
             name,
@@ -314,6 +346,61 @@ fn read_name(packet: &[u8], mut pos: usize) -> Option<(Name, usize)> {
     Some((Name(labels), end.unwrap_or(pos + 1)))
 }
 
+/// The types in an NSEC type bitmap (RFC 4034 section 4.1.2): windows of a
+/// block number, a length of 1-32 and that many bitmap octets. The windows
+/// must be in strictly increasing order, so the types come out sorted and
+/// unique without a sort. `None` if malformed.
+fn bitmap_types(mut b: &[u8]) -> Option<Vec<u16>> {
+    let mut types = Vec::new();
+    let mut last = None;
+    while !b.is_empty() {
+        let window = u16::from(*b.first()?);
+        if last.is_some_and(|prev| window <= prev) {
+            return None;
+        }
+        last = Some(window);
+        let len = usize::from(*b.get(1)?);
+        if len == 0 || len > 32 {
+            return None;
+        }
+        let octets = b.get(2..2 + len)?;
+        for (octet, &bits) in octets.iter().enumerate() {
+            for bit in 0..8 {
+                if bits & (0x80 >> bit) != 0 {
+                    types.push(window * 256 + (octet * 8 + bit) as u16);
+                }
+            }
+        }
+        b = &b[2 + len..];
+    }
+    Some(types)
+}
+
+/// The NSEC type bitmap for `types`. The sort is linear for parsed records
+/// only because `bitmap_types` guarantees they are already sorted.
+fn type_bitmap(types: &[u16]) -> Vec<u8> {
+    let mut sorted = types.to_vec();
+    crate::order::sort(&mut sorted);
+    sorted.dedup();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let window = sorted[i] >> 8;
+        let mut octets = [0u8; 32];
+        let mut len = 0;
+        while i < sorted.len() && sorted[i] >> 8 == window {
+            let low = usize::from(sorted[i] & 0xff);
+            octets[low / 8] |= 0x80 >> (low % 8);
+            len = len.max(low / 8 + 1);
+            i += 1;
+        }
+        out.push(window as u8);
+        out.push(len as u8);
+        out.extend_from_slice(&octets[..len]);
+    }
+    out
+}
+
 /// Encodes `msg`. Responses carry QR and AA (every answer here is
 /// authoritative), queries no flags. Names are compressed against earlier
 /// ones in the message, which keeps a probe for many aliases under one
@@ -355,7 +442,13 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         let len_at = w.out.len();
         w.u16(0);
         match &rec.rdata {
+            RData::A(addr) => w.out.extend_from_slice(&addr.octets()),
+            RData::Aaaa(addr) => w.out.extend_from_slice(&addr.octets()),
             RData::Cname(target) => w.name(target),
+            RData::Nsec { next, types } => {
+                w.name(next);
+                w.out.extend(type_bitmap(types));
+            }
             RData::Other(bytes) => w.out.extend_from_slice(bytes),
         }
         let len = (w.out.len() - len_at - 2) as u16;
@@ -528,7 +621,7 @@ mod tests {
                     class: CLASS_IN,
                     cache_flush: false,
                     ttl: 120,
-                    rdata: RData::Other(vec![192, 0, 2, 1]),
+                    rdata: RData::A(Ipv4Addr::new(192, 0, 2, 1)),
                 },
             ]
         );
@@ -591,7 +684,7 @@ mod tests {
                 class: CLASS_IN,
                 cache_flush: false,
                 ttl: 0,
-                rdata: RData::Other(vec![192, 0, 2, 1]),
+                rdata: RData::A(Ipv4Addr::new(192, 0, 2, 1)),
             }],
             additionals: vec![cname("web.local", "myhost.local")],
         };
@@ -633,5 +726,120 @@ mod tests {
         );
         let long = name(&vec!["a".repeat(60); 4].join("."));
         assert_eq!(long.under(&name("myhost.local")), Err(NameError::TooLong));
+    }
+
+    #[test]
+    fn address_and_nsec_records_round_trip() {
+        let msg = Message {
+            is_response: true,
+            answers: vec![
+                Record {
+                    name: name("app.myhost.local"),
+                    rtype: TYPE_A,
+                    class: CLASS_IN,
+                    cache_flush: true,
+                    ttl: 120,
+                    rdata: RData::A("192.0.2.10".parse().unwrap()),
+                },
+                Record {
+                    name: name("app.myhost.local"),
+                    rtype: TYPE_AAAA,
+                    class: CLASS_IN,
+                    cache_flush: true,
+                    ttl: 120,
+                    rdata: RData::Aaaa("fe80::1".parse().unwrap()),
+                },
+                Record {
+                    name: name("app.myhost.local"),
+                    rtype: TYPE_NSEC,
+                    class: CLASS_IN,
+                    cache_flush: true,
+                    ttl: 120,
+                    rdata: RData::Nsec {
+                        next: name("app.myhost.local"),
+                        types: vec![TYPE_A, TYPE_AAAA],
+                    },
+                },
+            ],
+            ..Message::default()
+        };
+        assert_eq!(parse(&encode(&msg)), Some(msg));
+    }
+
+    #[test]
+    fn nsec_bitmap_has_the_rfc_shape() {
+        let rec = Record {
+            name: name("app.local"),
+            rtype: TYPE_NSEC,
+            class: CLASS_IN,
+            cache_flush: false,
+            ttl: 120,
+            rdata: RData::Nsec {
+                next: name("app.local"),
+                types: vec![TYPE_AAAA, TYPE_A],
+            },
+        };
+        // RFC 4034 section 4.1.2: window 0, 4 octets, bit 1 (A) and bit 28
+        // (AAAA) set, most significant bit first.
+        let mut expected = name("app.local").to_wire();
+        expected.extend([0, 4, 0x40, 0, 0, 0x08]);
+        assert_eq!(rec.rdata_wire(), expected);
+    }
+
+    /// A response with one NSEC record for `app.local` carrying `bitmap`.
+    fn nsec_packet(bitmap: &[u8]) -> Vec<u8> {
+        let mut p = header(0x8400, [0, 1, 0, 0]);
+        p.extend_from_slice(b"\x03app\x05local\x00");
+        let mut rdata = b"\xC0\x0C".to_vec();
+        rdata.extend_from_slice(bitmap);
+        p.extend_from_slice(&[0, 47, 0, 1, 0, 0, 0, 120]);
+        p.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        p.extend_from_slice(&rdata);
+        p
+    }
+
+    #[test]
+    fn rejects_malformed_nsec_bitmaps() {
+        for bitmap in [&[0u8, 0][..], &[0, 33], &[0, 2, 0x40]] {
+            assert_eq!(parse(&nsec_packet(bitmap)), None, "bitmap {bitmap:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_nsec_windows_out_of_order() {
+        // Window 1 (type 257) before window 0 (type 1).
+        let bitmap = [1, 1, 0x40, 0, 1, 0x40];
+        assert_eq!(parse(&nsec_packet(&bitmap)), None);
+    }
+
+    #[test]
+    fn rejects_a_repeated_nsec_window() {
+        let bitmap = [0, 1, 0x40, 0, 1, 0x20];
+        assert_eq!(parse(&nsec_packet(&bitmap)), None);
+    }
+
+    #[test]
+    fn nsec_windows_in_ascending_order_round_trip() {
+        let types = vec![1, 28, 256 + 1];
+        let bitmap = type_bitmap(&types);
+        // Window 0 carries types 1 and 28, window 1 carries type 257.
+        assert_eq!(bitmap, [0, 4, 0x40, 0, 0, 0x08, 1, 1, 0x40]);
+        let msg = parse(&nsec_packet(&bitmap)).unwrap();
+        assert_eq!(
+            msg.answers[0].rdata,
+            RData::Nsec {
+                next: name("app.local"),
+                types,
+            }
+        );
+    }
+
+    #[test]
+    fn address_records_of_the_wrong_length_stay_raw() {
+        let mut p = header(0x8400, [0, 1, 0, 0]);
+        p.extend_from_slice(b"\x03app\x05local\x00");
+        p.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 120, 0, 3, 192, 0, 2]);
+        let msg = parse(&p).unwrap();
+        assert_eq!(msg.answers[0].rdata, RData::Other(vec![192, 0, 2]));
     }
 }

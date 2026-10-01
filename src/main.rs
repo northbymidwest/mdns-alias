@@ -1,7 +1,7 @@
-//! Publish extra mDNS host names for this machine, as CNAMEs of its own
-//! `.local` name.
+//! Publish extra mDNS host names for this machine, as address records by
+//! default, or as CNAMEs of its own `.local` name with `--cname`.
 //!
-//! Usage: `mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <name>...`
+//! Usage: `mdns-alias [--host <name.local>] [--cname] [--interface <name>]... [--require-sandbox] <name>...`
 
 #![forbid(unsafe_code)]
 
@@ -11,16 +11,19 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use mdns_alias::cli;
-use mdns_alias::net::Net;
-use mdns_alias::responder::{Family, Notice, Responder, Step};
+use mdns_alias::net::{Net, Settle};
+use mdns_alias::responder::{Family, Mode, Notice, Responder, Step};
 use mdns_alias::sandbox;
 use mdns_alias::signals::Signals;
 
 /// The kernel host name on Linux, where this is deployed. Elsewhere the
-/// read fails and `--target` is required.
+/// read fails and `--host` is required.
 const HOSTNAME_FILE: &str = "/proc/sys/kernel/hostname";
-/// Milliseconds between interface rescans.
-const RESCAN_INTERVAL: u64 = 30_000;
+/// Milliseconds between safety rescans when change notifications arrive.
+const SAFETY_RESCAN: u64 = 300_000;
+/// Milliseconds between rescans without notifications (macOS, or a host
+/// that refused the subscription).
+const POLL_RESCAN: u64 = 30_000;
 /// Largest mDNS message (RFC 6762 section 17).
 const MAX_MESSAGE: usize = 9000;
 
@@ -44,7 +47,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let (target, aliases) = cli::resolve(&cli, hostname.as_deref())?;
     // Only for probe jitter, so a hash of the pid with a random key is plenty.
     let seed = RandomState::new().hash_one(std::process::id());
-    let mut responder = Responder::new(aliases.clone(), target.clone(), seed)?;
+    let mode = if cli.cname {
+        Mode::Cname(target.clone())
+    } else {
+        Mode::Addresses
+    };
+    let mut responder = Responder::new(aliases.clone(), mode.clone(), seed);
     let signals = Signals::new()?;
     let (mut net, log) = Net::open(cli.interfaces)?;
     for line in log {
@@ -60,17 +68,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("--require-sandbox: not every sandbox layer could be applied".into());
     }
     for alias in &aliases {
-        eprintln!("mdns-alias: publishing {alias} -> {target}");
+        match &mode {
+            Mode::Cname(host) => eprintln!("mdns-alias: publishing {alias} -> {host}"),
+            Mode::Addresses => eprintln!("mdns-alias: publishing {alias}"),
+        }
     }
 
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
+    let interval = if net.has_events() {
+        SAFETY_RESCAN
+    } else {
+        POLL_RESCAN
+    };
+    let mut settle = Settle::default();
     let mut next_rescan = 0;
     let mut buf = vec![0; MAX_MESSAGE];
     while !signals.pending() {
-        if now() >= next_rescan {
+        let drained = net.drain_events();
+        if drained.overflow {
+            settle.overflowed();
+        } else if drained.changed {
+            settle.changed(now());
+        }
+        if settle.due(now()) || now() >= next_rescan {
+            settle.clear();
             rescan(&mut net, &mut responder, now());
-            next_rescan = now() + RESCAN_INTERVAL;
+            next_rescan = now() + interval;
         }
         for family in [Family::V4, Family::V6] {
             let received = net.recv(family, &mut buf);
@@ -108,11 +132,27 @@ fn rescan(net: &mut Net, responder: &mut Responder, now: u64) {
     for &link in &scan.removed {
         responder.remove_link(link);
     }
+    for (index, addrs) in scan.addresses {
+        if let Some(name) = net.interface_name(index) {
+            let list = if addrs.is_empty() {
+                "none stable".to_string()
+            } else {
+                addrs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            eprintln!("mdns-alias: addresses on {name}: {list}");
+        }
+        let step = responder.set_addresses(index, addrs, now);
+        dispatch(net, responder, step);
+    }
     for &link in &scan.added {
         responder.add_link(link, now);
     }
     if net.is_empty() {
-        eprintln!("mdns-alias: no usable interfaces yet, looking again in 30s");
+        eprintln!("mdns-alias: no usable interfaces yet");
     }
 }
 
@@ -122,6 +162,10 @@ fn dispatch(net: &mut Net, responder: &mut Responder, step: Step) {
             Notice::Announced(link) => eprintln!("mdns-alias: announced on {}", net.describe(link)),
             Notice::TiebreakLost(link) => eprintln!(
                 "mdns-alias: another host is probing for the same name on {}, probing again",
+                net.describe(link)
+            ),
+            Notice::Oversized(link, alias) => eprintln!(
+                "mdns-alias: {alias}'s records do not fit one packet on {}; not serving it there",
                 net.describe(link)
             ),
         }

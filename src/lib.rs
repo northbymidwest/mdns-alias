@@ -1,4 +1,5 @@
-//! Publish extra mDNS host names as CNAMEs of this host's own name. The
+//! Publish extra mDNS host names for this host, as address records by
+//! default or as CNAMEs of its own name with `--cname`. The
 //! binary in `main.rs` wires these modules to the network; the library exists
 //! so tests and the fuzz target can reach them.
 //!
@@ -9,6 +10,7 @@
 pub mod cli;
 pub mod net;
 pub mod netlink;
+pub mod order;
 pub mod responder;
 pub mod sandbox;
 pub mod signals;

@@ -182,12 +182,14 @@ jobs:
           set -e
           printf '%s\n' "$out"
           [ "$code" -eq 1 ] && printf '%s\n' "$out" | grep -q '^mdns-alias: usage:'
-      # The image under its own sandbox, on both architectures: it starts,
-      # reports seccomp, answers an mDNS query for an alias, and stops
-      # cleanly on SIGTERM as PID 1 (exit 0, goodbyes sent).
+      # The image under its own sandbox, on both architectures, in both
+      # modes. Default (A/AAAA): it starts, reports seccomp, answers an mDNS
+      # query for an alias with an A record, and stops cleanly on SIGTERM as
+      # PID 1 (exit 0, goodbyes sent). Then `--cname`: the same alias answers
+      # with a CNAME and stops cleanly.
       - run: |
           docker run -d --name smoke --network host --read-only --cap-drop ALL \
-            mdns-alias:ci --target ci-host.local smoke.ci-host.local
+            mdns-alias:ci --host ci-host.local smoke.ci-host.local
           sleep 3
           docker logs smoke
           # Every layer but Landlock, which older runner kernels may lack,
@@ -195,11 +197,17 @@ jobs:
           # looser pattern. (`! grep` would not fail the step under -e.)
           docker logs smoke 2>&1 | grep -qE '^mdns-alias: sandbox: .*, seccomp$'
           if docker logs smoke 2>&1 | grep -E 'sandbox: (rlimits|address-space limit|non-dumpable|no-new-privs|seccomp) unavailable'; then exit 1; fi
-          python3 scripts/mdns-query.py smoke.ci-host.local
+          python3 scripts/mdns-query.py smoke.ci-host.local A
           [ "$(docker inspect -f '{{.State.Running}}' smoke)" = true ]
           docker stop smoke > /dev/null
           [ "$(docker inspect -f '{{.State.ExitCode}}' smoke)" = 0 ]
           docker logs smoke 2>&1 | tail -1 | grep -q 'stopped'
+          docker run -d --name smoke-cname --network host --read-only --cap-drop ALL \
+            mdns-alias:ci --host ci-host.local --cname smoke.ci-host.local
+          sleep 3
+          python3 scripts/mdns-query.py smoke.ci-host.local CNAME
+          docker stop smoke-cname > /dev/null
+          [ "$(docker inspect -f '{{.State.ExitCode}}' smoke-cname)" = 0 ]
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-audit@0.22.2
