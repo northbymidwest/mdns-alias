@@ -41,9 +41,13 @@ impl IfIndex {
 
 const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
-/// How long a receive waits for a packet; also how long the loop waits after
-/// one fails, so a dead socket cannot spin it.
-pub const RECV_TIMEOUT: Duration = Duration::from_millis(100);
+/// Milliseconds a socket is left out of the wait after a receive on it
+/// fails, so a socket that keeps failing cannot spin the loop.
+pub const FAILURE_BACKOFF: u64 = 100;
+/// Longest wait without a way to wait on the sockets (macOS, a development
+/// platform): the loop then looks at every socket this often.
+#[cfg(not(target_os = "linux"))]
+const DEV_WAIT: Duration = Duration::from_millis(50);
 /// Container bridges and veths, skipped unless named with `--interface`:
 /// nothing on them resolves the host's LAN names.
 const SKIPPED_PREFIXES: [&str; 3] = ["docker", "br-", "veth"];
@@ -68,6 +72,11 @@ pub struct Net {
     #[cfg(target_os = "linux")]
     event_buf: Vec<u8>,
     drops: DropLog,
+    /// The notification socket's rest after a failed drain.
+    events_rest: Backoff,
+    /// Packets dropped for a full send buffer, per family, IPv4 first: the
+    /// first is logged, then at most one line a minute.
+    full: [FailureLog; 2],
     /// Lines to log, from opening, rescans and receives; collected by
     /// `take_log`.
     log: Vec<String>,
@@ -115,6 +124,40 @@ pub struct Received {
     pub len: usize,
     pub link: Link,
     pub source: SocketAddr,
+}
+
+/// What one read of a non-blocking socket found.
+pub enum Receive {
+    /// A packet for the responder.
+    Packet(Received),
+    /// A packet the responder must not see: on a link not served, or from
+    /// off-link. There may be more behind it.
+    Ignored,
+    /// Nothing waiting, or no socket for the family.
+    Empty,
+}
+
+/// What a wait found on one family's socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Readiness {
+    /// Not waited on: resting after a failure, no socket for the family, or
+    /// the wait was interrupted.
+    #[default]
+    Unwatched,
+    /// Waited on, and nothing to read: the socket is healthy.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux wait tells an idle socket from a readable one"
+        )
+    )]
+    Idle,
+    /// Something to read.
+    Readable,
+    /// The kernel reports an error condition on the socket (POLLERR,
+    /// POLLHUP or POLLNVAL). A read may still find packets, or the error.
+    Faulty,
 }
 
 /// One address on one interface, whichever way the platform lists them.
@@ -172,6 +215,8 @@ impl Net {
             #[cfg(target_os = "linux")]
             event_buf: vec![0; 8192],
             drops: DropLog::default(),
+            events_rest: Backoff::default(),
+            full: Default::default(),
             log,
         })
     }
@@ -243,16 +288,16 @@ impl Net {
         scan
     }
 
-    /// Waits up to 100 ms for a packet on one family's socket.
-    pub fn recv(&mut self, family: Family, buf: &mut [u8]) -> io::Result<Option<Received>> {
+    /// Reads one packet from one family's socket, without waiting.
+    pub fn recv(&mut self, family: Family, buf: &mut [u8]) -> io::Result<Receive> {
         let Ok(sock) = self.socket(family) else {
-            return Ok(None);
+            return Ok(Receive::Empty);
         };
         match sock.recv(buf) {
             Ok((len, info)) => {
                 // Index 0, or one out of range, is no interface we serve.
                 let Some(index) = u32::try_from(info.if_index).ok().and_then(IfIndex::new) else {
-                    return Ok(None);
+                    return Ok(Receive::Ignored);
                 };
                 let link = Link { index, family };
                 // Off-link senders (RFC 6762 section 11), and anything on a
@@ -262,7 +307,7 @@ impl Net {
                 // silently.
                 match verdict(&self.joined, link, info.addr_src.ip()) {
                     Verdict::Accept => {}
-                    Verdict::Unserved => return Ok(None),
+                    Verdict::Unserved => return Ok(Receive::Ignored),
                     Verdict::OffLink => {
                         if self.drops.first(link) {
                             self.log.push(format!(
@@ -272,10 +317,10 @@ impl Net {
                                 self.describe(link)
                             ));
                         }
-                        return Ok(None);
+                        return Ok(Receive::Ignored);
                     }
                 }
-                Ok(Some(Received {
+                Ok(Receive::Packet(Received {
                     len,
                     link,
                     source: info.addr_src,
@@ -284,15 +329,82 @@ impl Net {
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
-                Ok(None)
+                Ok(Receive::Empty)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// A packet for `family` was dropped at `now` for a full send buffer.
+    /// `Some(n)` means log it, noting the `n` drops skipped since the last
+    /// line: the first is logged, then at most one line a minute.
+    pub fn send_dropped(&mut self, family: Family, now: u64) -> Option<u64> {
+        self.full[slot(family)].failed(now)
+    }
+
+    /// Waits until a socket of a family in `watch` has something to read or
+    /// reports an error, the notification socket (unless resting at `now`)
+    /// or `wake` (the signalfd) is readable, or `timeout` passes; then says
+    /// what it found on each family's socket, IPv4 first.
+    ///
+    /// A failure other than an interruption should be unreachable: the
+    /// entry count is fixed at 4, which the descriptor cap always allows,
+    /// the timeout is a valid timespec, and every pointer is to a live
+    /// local. So it is fatal; do not add retries, which could only spin.
+    #[cfg(target_os = "linux")]
+    pub fn wait(
+        &self,
+        wake: Option<RawFd>,
+        watch: [bool; 2],
+        now: u64,
+        timeout: Duration,
+    ) -> io::Result<[Readiness; 2]> {
+        use crate::sys::{self, poll_entry};
+
+        let watched = |slot: usize, sock: &Option<PktInfoUdpSocket>| match sock {
+            Some(sock) if watch[slot] => sock.as_raw_fd(),
+            _ => -1,
+        };
+        let events = match &self.events {
+            Some(sock) if self.events_rest.until(now).is_none() => sock.as_raw_fd(),
+            _ => -1,
+        };
+        let mut fds = [
+            watched(0, &self.v4),
+            watched(1, &self.v6),
+            events,
+            wake.unwrap_or(-1),
+        ]
+        .map(poll_entry);
+        match sys::poll(&mut fds, timeout) {
+            Ok(_) => Ok([0, 1].map(|slot| readiness(fds[slot].fd, fds[slot].revents))),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok([Readiness::Unwatched; 2]),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `wait` without a way to wait on the sockets: sleeps for `timeout`,
+    /// but no more than `DEV_WAIT`, then has every watched socket read.
+    /// Development platforms only.
+    #[cfg(not(target_os = "linux"))]
+    pub fn wait(
+        &self,
+        _wake: Option<RawFd>,
+        watch: [bool; 2],
+        _now: u64,
+        timeout: Duration,
+    ) -> io::Result<[Readiness; 2]> {
+        std::thread::sleep(timeout.min(DEV_WAIT));
+        let mut ready = [Readiness::Unwatched; 2];
+        for (slot, family) in [Family::V4, Family::V6].into_iter().enumerate() {
+            if watch[slot] && self.socket(family).is_ok() {
+                ready[slot] = Readiness::Readable;
+            }
+        }
+        Ok(ready)
     }
 
     /// Sends on the packet's link: multicast to the group there, or unicast.
@@ -365,13 +477,37 @@ impl Net {
         false
     }
 
-    /// Reads every pending change notification without blocking.
-    pub fn drain_events(&mut self) -> crate::netlink::Drained {
+    /// Reads every pending change notification without blocking. After a
+    /// failed drain the socket rests for `FAILURE_BACKOFF` ms: left out of
+    /// the wait and not read. The failure itself counts as a change.
+    pub fn drain_events(&mut self, now: u64) -> crate::netlink::Drained {
+        if self.events_rest.until(now).is_some() {
+            return crate::netlink::Drained::default();
+        }
+        let drained = self.read_events();
+        self.note_drain(&drained, now);
+        drained
+    }
+
+    fn read_events(&mut self) -> crate::netlink::Drained {
         #[cfg(target_os = "linux")]
         if let Some(sock) = &self.events {
             return crate::netlink::drain(sock, &mut self.event_buf);
         }
         crate::netlink::Drained::default()
+    }
+
+    /// Starts the notification socket's rest if `drained` failed.
+    fn note_drain(&mut self, drained: &crate::netlink::Drained, now: u64) {
+        if drained.failed {
+            self.events_rest.start(now);
+        }
+    }
+
+    /// When the notification socket's rest under way at `now` ends, for the
+    /// wait's timeout.
+    pub fn events_rest_until(&self, now: u64) -> Option<u64> {
+        self.events_rest.until(now)
     }
 
     /// The name of a served interface, for logs.
@@ -442,16 +578,19 @@ fn socket(family: Family) -> io::Result<PktInfoUdpSocket> {
     let sock = PktInfoUdpSocket::new(domain)?;
     sock.set_reuse_address(true)?;
     sock.set_reuse_port(true)?;
-    // A std handle on the same socket, for the options PktInfoUdpSocket does
-    // not offer. Dropping it closes only the duplicate descriptor.
-    let handle = sock.try_clone_std()?;
-    handle.set_read_timeout(Some(RECV_TIMEOUT))?;
+    // The loop waits on every descriptor at once, then reads each until it
+    // is empty.
+    sock.set_nonblocking(true)?;
     match family {
         Family::V4 => {
             sock.set_multicast_loop_v4(true)?;
             sock.set_multicast_ttl_v4(255)?;
         }
         Family::V6 => {
+            // A std handle on the same socket, for the option
+            // PktInfoUdpSocket does not offer. Dropping it closes only the
+            // duplicate descriptor.
+            let handle = sock.try_clone_std()?;
             // Otherwise Linux delivers IPv4 traffic here too, as mapped
             // addresses, and every IPv4 query would be answered twice.
             SockRef::from(&handle).set_only_v6(true)?;
@@ -566,6 +705,49 @@ impl DropLog {
 
     fn reset(&mut self) {
         self.0.clear();
+    }
+}
+
+/// A family's place in per-family arrays: IPv4 first.
+const fn slot(family: Family) -> usize {
+    match family {
+        Family::V4 => 0,
+        Family::V6 => 1,
+    }
+}
+
+/// What a wait's report on descriptor `fd` means for a socket: -1 (left
+/// out) is unwatched, any error bit is faulty.
+#[cfg(target_os = "linux")]
+fn readiness(fd: RawFd, revents: libc::c_short) -> Readiness {
+    if fd < 0 {
+        Readiness::Unwatched
+    } else if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        Readiness::Faulty
+    } else if revents & libc::POLLIN != 0 {
+        Readiness::Readable
+    } else {
+        Readiness::Idle
+    }
+}
+
+/// When a socket whose receive failed is waited on again.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    /// The end of the rest, in ms; may have passed.
+    until: Option<u64>,
+}
+
+impl Backoff {
+    /// A receive failed at `now`: rest for `FAILURE_BACKOFF` ms.
+    pub fn start(&mut self, now: u64) {
+        self.until = Some(now.saturating_add(FAILURE_BACKOFF));
+    }
+
+    /// When the rest that is under way at `now` ends; `None` if there is
+    /// none, so a rest that has ended never sets a timeout in the past.
+    pub fn until(&self, now: u64) -> Option<u64> {
+        self.until.filter(|&until| now < until)
     }
 }
 
@@ -739,12 +921,16 @@ impl Settle {
     }
 
     pub fn due(&self, now: u64) -> bool {
+        self.due_at().is_some_and(|due| now >= due)
+    }
+
+    /// When the rescan is due, in ms, for the wait's timeout; `None` while
+    /// no notification is waiting for one.
+    pub fn due_at(&self) -> Option<u64> {
         match *self {
-            Settle::Idle => false,
-            Settle::Burst { first, last } => {
-                now >= last + SETTLE_QUIET || now >= first + SETTLE_MAX
-            }
-            Settle::Overflow => true,
+            Settle::Idle => None,
+            Settle::Burst { first, last } => Some((last + SETTLE_QUIET).min(first + SETTLE_MAX)),
+            Settle::Overflow => Some(0),
         }
     }
 
@@ -1025,6 +1211,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             event_buf: Vec::new(),
             drops: DropLog::default(),
+            events_rest: Backoff::default(),
+            full: Default::default(),
             log: Vec::new(),
         }
     }
@@ -1211,6 +1399,84 @@ mod tests {
         assert!(s.due(1450));
         s.clear();
         assert!(!s.due(9000));
+    }
+
+    #[test]
+    fn settle_says_when_it_is_due() {
+        let mut s = Settle::default();
+        assert_eq!(s.due_at(), None);
+        s.changed(1000);
+        assert_eq!(s.due_at(), Some(1250));
+        s.changed(1200);
+        assert_eq!(s.due_at(), Some(1450));
+        // Never past the cap after the first notification.
+        s.changed(2900);
+        assert_eq!(s.due_at(), Some(3000));
+        s.overflowed();
+        assert_eq!(s.due_at(), Some(0));
+        s.clear();
+        assert_eq!(s.due_at(), None);
+    }
+
+    #[test]
+    fn a_failed_socket_rests_then_is_waited_on_again() {
+        let mut rest = Backoff::default();
+        assert_eq!(rest.until(0), None);
+        rest.start(1_000);
+        assert_eq!(rest.until(1_000), Some(1_100));
+        assert_eq!(rest.until(1_099), Some(1_100));
+        // Over: no deadline left behind to wake the loop at once forever.
+        assert_eq!(rest.until(1_100), None);
+        assert_eq!(rest.until(5_000), None);
+        // Another failure starts another rest.
+        rest.start(5_000);
+        assert_eq!(rest.until(5_000), Some(5_100));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_results_map_to_readiness() {
+        assert_eq!(readiness(-1, 0), Readiness::Unwatched);
+        assert_eq!(readiness(3, 0), Readiness::Idle);
+        assert_eq!(readiness(3, libc::POLLIN), Readiness::Readable);
+        for bit in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
+            assert_eq!(readiness(3, bit), Readiness::Faulty);
+            assert_eq!(readiness(3, bit | libc::POLLIN), Readiness::Faulty);
+        }
+    }
+
+    #[test]
+    fn a_failed_drain_rests_the_notification_socket() {
+        use crate::netlink::Drained;
+
+        let mut net = unconnected(BTreeMap::new());
+        net.note_drain(&Drained::default(), 1_000);
+        assert_eq!(net.events_rest_until(1_000), None);
+        let failed = Drained {
+            changed: true,
+            overflow: false,
+            failed: true,
+        };
+        net.note_drain(&failed, 1_000);
+        assert_eq!(net.events_rest_until(1_000), Some(1_100));
+        // Resting: not read at all, so nothing to report.
+        assert_eq!(net.drain_events(1_050), Drained::default());
+        assert_eq!(net.events_rest_until(1_100), None);
+        assert_eq!(net.drain_events(1_100), Drained::default());
+    }
+
+    #[test]
+    fn full_buffer_drops_are_logged_per_family_then_once_a_minute() {
+        let mut net = unconnected(BTreeMap::new());
+        assert_eq!(net.send_dropped(Family::V4, 1_000), Some(0));
+        assert_eq!(net.send_dropped(Family::V4, 1_010), None);
+        assert_eq!(net.send_dropped(Family::V4, 1_020), None);
+        // The other family has a log of its own.
+        assert_eq!(net.send_dropped(Family::V6, 1_020), Some(0));
+        assert_eq!(net.send_dropped(Family::V4, 60_999), None);
+        assert_eq!(net.send_dropped(Family::V4, 61_000), Some(3));
+        // Long after, a lone drop is logged with the count so far.
+        assert_eq!(net.send_dropped(Family::V6, 500_000), Some(0));
     }
 
     #[test]

@@ -8,6 +8,43 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Added
+
+- Queries with the TC (truncated) bit set, whose known answers continue in
+  later packets, are answered after a random 400-500 ms instead of at once,
+  with every known answer the querier sent in the meantime suppressing what
+  it already has (RFC 6762 section 7.2). A further TC packet extends the
+  wait, to at most 2 s after the first. Other queries from a querier that
+  is being waited on are answered with its pending query. Probes and legacy
+  unicast queries are still answered at once, and at most 32 queries wait
+  per interface and family; more are answered at once, as before.
+
+### Changed
+
+- The main loop waits on both sockets, the signalfd and the notification
+  socket at once, until the next timer is due, instead of waiting up to
+  100 ms on each socket in turn. An idle process now sleeps until its next
+  rescan (5 minutes, or 30 seconds without notifications) instead of waking
+  5 to 10 times a second, and probes, announcements and delayed answers go
+  out within a few milliseconds of when they are due instead of up to about
+  200 ms late. The sockets are non-blocking: a packet that does not fit the
+  send buffer is dropped instead of waiting for room, and logged per family
+  as `send buffer full on <interface> (IPv4), dropped a packet; logging
+  again at most once a minute`, then at most once a minute with a count of
+  the drops skipped. Goodbyes at shutdown are best-effort too: any that do
+  not fit the send buffer are dropped.
+- A socket whose receive fails is left out of the wait for 100 ms instead of
+  the loop sleeping, with the same rate-limited log lines as before. An
+  error condition the kernel reports on a socket with nothing to read
+  counts as a failure (`receive on IPv4 failed: the socket reports an
+  error; ...`). The notification socket rests the same way after a failed
+  read, which still counts as an address change and leads to a rescan.
+- The seccomp allowlist now allows `ppoll`, with four entries and no signal
+  mask only, and no longer allows `clock_nanosleep`: nothing sleeps any
+  more.
+
 ## 0.5.1 - 2026-10-01
 
 ### Changed

@@ -63,6 +63,7 @@ const QU_BIT: u16 = 0x8000;
 const CACHE_FLUSH_BIT: u16 = 0x8000;
 const FLAG_QR: u16 = 0x8000;
 const FLAG_AA: u16 = 0x0400;
+const FLAG_TC: u16 = 0x0200;
 const OPCODE_MASK: u16 = 0x7800;
 const RCODE_MASK: u16 = 0x000F;
 const MAX_LABEL: usize = 63;
@@ -103,6 +104,13 @@ impl fmt::Display for NameError {
 impl std::error::Error for NameError {}
 
 impl Name {
+    /// Every constructor ends here: `labels` and the rest rely on a buffer
+    /// of length-prefixed labels ending in the root byte, at most 255 bytes.
+    fn from_wire(wire: Box<[u8]>) -> Name {
+        debug_assert!(wire.last() == Some(&0) && wire.len() <= MAX_NAME);
+        Name(wire)
+    }
+
     /// Parses dotted text: `app.myhost.local`, with or without the final dot.
     /// The first empty or overlong label is the error, before the length.
     pub fn parse(text: &str) -> Result<Name, NameError> {
@@ -127,7 +135,7 @@ impl Name {
         if wire.len() > MAX_NAME {
             return Err(NameError::TooLong);
         }
-        Ok(Name(wire.into_boxed_slice()))
+        Ok(Name::from_wire(wire.into_boxed_slice()))
     }
 
     /// The labels, in order, without length bytes or the root.
@@ -162,7 +170,7 @@ impl Name {
         let mut wire = Vec::with_capacity(len);
         wire.extend_from_slice(labels);
         wire.extend_from_slice(&base.0);
-        Ok(Name(wire.into_boxed_slice()))
+        Ok(Name::from_wire(wire.into_boxed_slice()))
     }
 
     /// Uncompressed wire form, which record comparison (RFC 6762 section
@@ -261,24 +269,48 @@ pub enum RData {
         next: Name,
         types: Types,
     },
-    /// Any other type, or an address record of the wrong length, as raw
-    /// bytes. Parsing never yields this for CNAME or NSEC, nor for A or AAAA
-    /// of the right length; records built here must not either, or they
-    /// would not compare equal to the same record parsed.
-    Other {
-        rtype: RType,
-        bytes: Vec<u8>,
-    },
+    /// Any other type, or an address record of the wrong length.
+    Other(Unknown),
+}
+
+/// Raw rdata of a type the parser does not decode, or an address record of
+/// the wrong length. The fields are private so that `Unknown` never holds
+/// what the parser would decode into a typed variant: a record built here
+/// would not compare equal to the same record parsed. Only the parser and
+/// `RData::other` build one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unknown {
+    rtype: RType,
+    bytes: Vec<u8>,
+}
+
+impl Unknown {
+    pub fn rtype(&self) -> RType {
+        self.rtype
+    }
 }
 
 impl RData {
+    /// Raw rdata of `rtype`, or `None` when the parser would decode these
+    /// bytes into a typed variant instead: CNAME and NSEC (which the parser
+    /// never leaves raw), A of 4 bytes and AAAA of 16.
+    pub fn other(rtype: RType, bytes: Vec<u8>) -> Option<RData> {
+        let typed = match rtype {
+            RType::CNAME | RType::NSEC => true,
+            RType::A => bytes.len() == 4,
+            RType::AAAA => bytes.len() == 16,
+            _ => false,
+        };
+        (!typed).then_some(RData::Other(Unknown { rtype, bytes }))
+    }
+
     fn rtype(&self) -> RType {
         match self {
             RData::A(_) => RType::A,
             RData::Aaaa(_) => RType::AAAA,
             RData::Cname(_) => RType::CNAME,
             RData::Nsec { .. } => RType::NSEC,
-            RData::Other { rtype, .. } => *rtype,
+            RData::Other(raw) => raw.rtype,
         }
     }
 }
@@ -310,7 +342,7 @@ impl Record {
                 out.extend(type_bitmap(types));
                 out
             }
-            RData::Other { bytes, .. } => bytes.clone(),
+            RData::Other(raw) => raw.bytes.clone(),
         }
     }
 }
@@ -319,6 +351,10 @@ impl Record {
 pub struct Message {
     pub id: u16,
     pub is_response: bool,
+    /// TC: in a query, more known answers follow in later packets from the
+    /// same querier (RFC 6762 section 7.2); in a response, ignored (section
+    /// 18.5).
+    pub truncated: bool,
     pub questions: Vec<Question>,
     pub answers: Vec<Record>,
     pub authorities: Vec<Record>,
@@ -339,6 +375,7 @@ pub fn parse(packet: &[u8]) -> Option<Message> {
     let mut msg = Message {
         id,
         is_response: flags & FLAG_QR != 0,
+        truncated: flags & FLAG_TC != 0,
         ..Message::default()
     };
     for _ in 0..counts[0] {
@@ -420,7 +457,7 @@ impl Reader<'_> {
                 let types = bitmap_types(self.packet.get(end..start + len)?)?;
                 RData::Nsec { next, types }
             }
-            _ => RData::Other { rtype, bytes: raw },
+            _ => RData::Other(Unknown { rtype, bytes: raw }),
         };
         Some(Record {
             name,
@@ -472,7 +509,10 @@ fn read_name(packet: &[u8], mut pos: usize) -> Option<(Name, usize)> {
         }
     }
     // `wire[len]` is still zero: the root label.
-    Some((Name(Box::from(&wire[..=len])), end.unwrap_or(pos + 1)))
+    Some((
+        Name::from_wire(Box::from(&wire[..=len])),
+        end.unwrap_or(pos + 1),
+    ))
 }
 
 /// The types in an NSEC type bitmap (RFC 4034 section 4.1.2): windows of a
@@ -528,20 +568,21 @@ fn type_bitmap(types: &Types) -> Vec<u8> {
 }
 
 /// Encodes `msg`. Responses carry QR and AA (every answer here is
-/// authoritative), queries no flags. Names are compressed against earlier
-/// ones in the message, which keeps a probe for many aliases under one
-/// target small.
+/// authoritative), queries no flags, and either TC if `truncated`. Names
+/// are compressed against earlier ones in the message, which keeps a probe
+/// for many aliases under one target small.
 pub fn encode(msg: &Message) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(512),
         suffixes: Vec::new(),
     };
     w.u16(msg.id);
-    w.u16(if msg.is_response {
+    let qr_aa = if msg.is_response {
         FLAG_QR | FLAG_AA
     } else {
         0
-    });
+    };
+    w.u16(qr_aa | if msg.truncated { FLAG_TC } else { 0 });
     for count in [
         msg.questions.len(),
         msg.answers.len(),
@@ -575,7 +616,7 @@ pub fn encode(msg: &Message) -> Vec<u8> {
                 w.name(next);
                 w.out.extend(type_bitmap(types));
             }
-            RData::Other { bytes, .. } => w.out.extend_from_slice(bytes),
+            RData::Other(raw) => w.out.extend_from_slice(&raw.bytes),
         }
         let len = (w.out.len() - len_at - 2) as u16;
         w.out[len_at..len_at + 2].copy_from_slice(&len.to_be_bytes());
@@ -834,6 +875,7 @@ mod tests {
         let msg = Message {
             id: 7,
             is_response: true,
+            truncated: false,
             questions: vec![Question {
                 name: name("app.myhost.local"),
                 qtype: RType::ANY,
@@ -862,6 +904,28 @@ mod tests {
             ..Message::default()
         };
         assert_eq!(encode(&response)[2..4], [0x84, 0x00]);
+    }
+
+    #[test]
+    fn parses_and_encodes_the_truncated_bit() {
+        // TC alone, and TC with RD, which is dropped.
+        for flags in [0x0200, 0x0300] {
+            let mut p = header(flags, [1, 0, 0, 0]);
+            p.extend_from_slice(b"\x03app\x05local\x00\x00\x01\x00\x01");
+            let msg = parse(&p).unwrap();
+            assert!(msg.truncated && !msg.is_response);
+            assert_eq!(encode(&msg)[2..4], [0x02, 0x00]);
+            assert_eq!(parse(&encode(&msg)), Some(msg));
+        }
+        let mut p = header(0, [1, 0, 0, 0]);
+        p.extend_from_slice(b"\x03app\x05local\x00\x00\x01\x00\x01");
+        assert!(!parse(&p).unwrap().truncated);
+        let response = Message {
+            is_response: true,
+            truncated: true,
+            ..Message::default()
+        };
+        assert_eq!(encode(&response)[2..4], [0x86, 0x00]);
     }
 
     #[test]
@@ -1000,11 +1064,19 @@ mod tests {
         let msg = parse(&p).unwrap();
         assert_eq!(
             msg.answers[0].rdata,
-            RData::Other {
-                rtype: RType::A,
-                bytes: vec![192, 0, 2]
-            }
+            RData::other(RType::A, vec![192, 0, 2]).unwrap()
         );
+    }
+
+    #[test]
+    fn raw_rdata_refuses_what_the_parser_would_type() {
+        assert!(RData::other(RType::A, vec![0; 4]).is_none());
+        assert!(RData::other(RType::AAAA, vec![0; 16]).is_none());
+        assert!(RData::other(RType::CNAME, vec![0]).is_none());
+        assert!(RData::other(RType::NSEC, vec![0]).is_none());
+        assert!(RData::other(RType::A, vec![0; 3]).is_some());
+        assert!(RData::other(RType::AAAA, vec![0; 4]).is_some());
+        assert!(RData::other(RType(16), vec![0; 4]).is_some());
     }
 
     #[test]
@@ -1025,10 +1097,7 @@ mod tests {
     #[test]
     fn a_record_type_comes_from_its_data() {
         assert_eq!(cname("app.local", "myhost.local").rtype(), RType::CNAME);
-        let other = RData::Other {
-            rtype: RType(16),
-            bytes: vec![1, b'x'],
-        };
+        let other = RData::other(RType(16), vec![1, b'x']).unwrap();
         assert_eq!(other.rtype(), RType(16));
     }
     /// Hex to bytes, for the test vectors below.
@@ -1180,10 +1249,7 @@ mod tests {
                     class: Class::IN,
                     cache_flush: false,
                     ttl: 1,
-                    rdata: RData::Other {
-                        rtype: RType(16),
-                        bytes: vec![0x5a; 0x4000],
-                    },
+                    rdata: RData::other(RType(16), vec![0x5a; 0x4000]).unwrap(),
                 },
                 a_record("late.big.local", 3),
                 a_record("late.big.local", 4),

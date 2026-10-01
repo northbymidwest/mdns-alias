@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 use mdns_alias::testing::responder::Conflict;
 use mdns_alias::testing::sandbox::Layer;
@@ -85,6 +86,16 @@ fn seccomp_allows_the_steady_state() {
         let to = receiver.try_clone_std().unwrap().local_addr().unwrap();
         let sender = UdpSocket::bind(local).unwrap();
         let v6 = PktInfoUdpSocket::new(Domain::IPV6).ok();
+        let events = netlink::subscribe().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        // As the main loop fills them: IPv4, IPv6 (-1 without), the
+        // notification socket, the signalfd.
+        let entries = [
+            receiver.as_raw_fd(),
+            v6.as_ref().map_or(-1, |v6| v6.as_raw_fd()),
+            events.as_raw_fd(),
+            signals.fd().unwrap(),
+        ];
         seccomp();
         // A rescan: the netlink dump, then joining and leaving groups. On
         // loopback the joins may fail; the calls just must not be killed.
@@ -101,12 +112,21 @@ fn seccomp_allows_the_steady_state() {
         }
         // A packet out and back in, as replies and queries travel, and a
         // send that fails, as to an unreachable querier.
+        // The main loop's wait: the packet makes the socket ready, then
+        // reading until the socket has nothing more, then a wait that times
+        // out, as an idle loop's does.
         sender.send_to(b"ping", to).unwrap();
+        let mut fds = entries.map(sys::poll_entry);
+        let woke = sys::poll(&mut fds, Duration::from_secs(5)).unwrap_or(0) >= 1
+            && fds[0].revents & libc::POLLIN != 0;
         let mut buf = [0u8; 16];
         let got = receiver.recv(&mut buf).map_or(0, |(n, _)| n);
+        let drained = receiver
+            .recv(&mut buf)
+            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock);
+        let mut fds = entries.map(sys::poll_entry);
+        let timed_out = sys::poll(&mut fds, Duration::from_millis(5)).ok() == Some(0);
         let _ = sender.send_to(b"x", (Ipv4Addr::BROADCAST, 9));
-        // Waiting out a failed receive.
-        std::thread::sleep(std::time::Duration::from_millis(5));
         let quiet = !signals.pending();
         let buffer = vec![1u8; 1 << 20];
         std::hint::black_box(&buffer);
@@ -119,8 +139,39 @@ fn seccomp_allows_the_steady_state() {
         }
         std::hint::black_box(&grow);
         drop(grow);
-        eprintln!("sandboxed child: rescanned {rescanned}, received {got}");
-        exit_now(if rescanned && got == 4 && quiet { 0 } else { 3 });
+        eprintln!(
+            "sandboxed child: rescanned {rescanned}, woke {woke}, received {got}, \
+             drained {drained}, timed out {timed_out}"
+        );
+        let waited = woke && drained && timed_out;
+        exit_now(if rescanned && got == 4 && waited && quiet {
+            0
+        } else {
+            3
+        });
+    };
+    assert!(status.success(), "{status:?}");
+}
+
+#[test]
+fn a_signal_wakes_the_wait_under_seccomp() {
+    let Some(status) = in_child("a_signal_wakes_the_wait_under_seccomp") else {
+        let signals = Signals::new().unwrap();
+        // SAFETY: raise() takes an integer and touches no memory. SIGTERM
+        // is blocked, so it queues on the signalfd. Before lockdown: the
+        // filter lets this thread signal itself with SIGABRT only.
+        unsafe { libc::raise(libc::SIGTERM) };
+        seccomp();
+        let mut fds = [-1, -1, -1, signals.fd().unwrap()].map(sys::poll_entry);
+        let start = std::time::Instant::now();
+        let ready = sys::poll(&mut fds, Duration::from_secs(10)).unwrap_or(0);
+        let prompt = start.elapsed() < Duration::from_secs(1);
+        let woke = ready == 1 && fds[3].revents & libc::POLLIN != 0;
+        exit_now(if prompt && woke && signals.pending() {
+            0
+        } else {
+            3
+        });
     };
     assert!(status.success(), "{status:?}");
 }

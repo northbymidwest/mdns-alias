@@ -3,13 +3,14 @@
 
 use std::error::Error;
 use std::hash::{BuildHasher, RandomState};
+use std::io;
 use std::net::IpAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cli;
 use crate::net::IfIndex;
-use crate::net::{FailureLog, Net, RECV_TIMEOUT, Rescan, Settle};
-use crate::responder::{Family, Mode, Notice, Responder, Step};
+use crate::net::{Backoff, FailureLog, Net, Readiness, Receive, Rescan, Settle};
+use crate::responder::{Conflict, Family, Mode, Notice, Responder, Step};
 use crate::sandbox;
 use crate::signals::Signals;
 
@@ -23,6 +24,11 @@ const SAFETY_RESCAN: u64 = 300_000;
 const POLL_RESCAN: u64 = 30_000;
 /// Largest mDNS message (RFC 6762 section 17).
 const MAX_MESSAGE: usize = 9000;
+/// Most packets read from one socket per pass of the loop, so a busy socket
+/// cannot keep the other one, the timers or a shutdown waiting.
+const READ_BURST: usize = 32;
+/// The families, in the order `Net::wait` reports on them.
+const FAMILIES: [Family; 2] = [Family::V4, Family::V6];
 
 /// Runs the responder until SIGINT or SIGTERM. An error is fatal: bad
 /// arguments, no usable socket, an unmet `--require-sandbox`, or a name
@@ -72,10 +78,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut settle = Settle::default();
     let mut next_rescan = 0;
     let mut buf = vec![0; MAX_MESSAGE];
-    let mut v4_failures = FailureLog::default();
-    let mut v6_failures = FailureLog::default();
+    let mut health: [Health; 2] = Default::default();
+    // Nothing to read before the first wait.
+    let mut ready = [Readiness::Unwatched; 2];
     while !signals.pending() {
-        let drained = net.drain_events();
+        let drained = net.drain_events(now());
         if drained.overflow {
             settle.overflowed();
         } else if drained.changed {
@@ -86,44 +93,42 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             rescan(&mut net, &mut responder, now());
             next_rescan = now() + interval;
         }
-        for family in [Family::V4, Family::V6] {
-            let received = net.recv(family, &mut buf);
-            log_net(&mut net);
-            let failures = match family {
-                Family::V4 => &mut v4_failures,
-                Family::V6 => &mut v6_failures,
-            };
-            if received.is_ok()
-                && let Some(skipped) = failures.recovered()
-            {
-                eprintln!(
-                    "mdns-alias: receiving on {family} works again{}",
-                    not_logged(skipped, "failure")
-                );
-            }
-            match received {
-                Ok(Some(got)) => {
-                    // A conflict ends the program: the name is someone else's.
-                    let step = responder.handle(&buf[..got.len], got.link, got.source, now())?;
-                    dispatch(&mut net, &mut responder, step);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    // A failed receive returns at once, so wait out the time
-                    // it would have, or a dead socket spins the loop.
-                    if let Some(skipped) = failures.failed(now()) {
-                        eprintln!(
-                            "mdns-alias: receive on {family} failed: {e}{}; \
-                             retrying, and logging again at most once a minute",
-                            not_logged(skipped, "")
-                        );
-                    }
-                    std::thread::sleep(RECV_TIMEOUT);
+        for ((family, health), readiness) in FAMILIES.into_iter().zip(&mut health).zip(ready) {
+            match readiness {
+                Readiness::Unwatched => {}
+                // Waited on without an error: whatever failed is over.
+                Readiness::Idle => health.recovered(family),
+                Readiness::Readable | Readiness::Faulty => {
+                    let faulty = readiness == Readiness::Faulty;
+                    receive(
+                        &mut net,
+                        &mut responder,
+                        family,
+                        health,
+                        faulty,
+                        &mut buf,
+                        &now,
+                    )?;
                 }
             }
         }
         let step = responder.poll(now());
-        dispatch(&mut net, &mut responder, step);
+        dispatch(&mut net, &mut responder, step, now());
+
+        // Sleep until a descriptor wakes us or the next timer is due.
+        let at = now();
+        let watch = health.each_ref().map(|h| h.rest.until(at).is_none());
+        let others = [
+            responder.next_due(),
+            settle.due_at(),
+            net.events_rest_until(at),
+        ]
+        .into_iter()
+        .chain(health.iter().map(|h| h.rest.until(at)));
+        let timeout = Duration::from_millis(timeout(at, next_rescan, others));
+        ready = net
+            .wait(signals.fd(), watch, at, timeout)
+            .map_err(|e| format!("cannot wait for packets: {e}"))?;
     }
 
     // Goodbyes make clients forget the names now rather than when their
@@ -132,6 +137,97 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let _ = net.send(&out);
     }
     eprintln!("mdns-alias: stopped");
+    Ok(())
+}
+
+/// How long the loop may wait at `now`, in ms: until the next rescan at
+/// `rescan`, or the earliest of `others` if sooner (the responder's next
+/// send, the end of a burst of notifications, the end of a socket's rest,
+/// mDNS or notification);
+/// 0 if one of them is already due. Times are ms since the start.
+fn timeout(now: u64, rescan: u64, others: impl IntoIterator<Item = Option<u64>>) -> u64 {
+    others
+        .into_iter()
+        .flatten()
+        .fold(rescan, u64::min)
+        .saturating_sub(now)
+}
+
+/// One family's socket health: its failure log, and its rest after a
+/// failure.
+#[derive(Debug, Default)]
+struct Health {
+    failures: FailureLog,
+    rest: Backoff,
+}
+
+impl Health {
+    /// A receive or a wait went well: logs the end of a run of failures.
+    fn recovered(&mut self, family: Family) {
+        if let Some(skipped) = self.failures.recovered() {
+            eprintln!(
+                "mdns-alias: receiving on {family} works again{}",
+                not_logged(skipped, "failure")
+            );
+        }
+    }
+
+    /// A receive failed at `now`: logs it, rate-limited, and rests the
+    /// socket, so one that keeps failing cannot spin the loop.
+    fn failed(&mut self, family: Family, e: &io::Error, now: u64) {
+        if let Some(skipped) = self.failures.failed(now) {
+            eprintln!(
+                "mdns-alias: receive on {family} failed: {e}{}; \
+                 retrying, and logging again at most once a minute",
+                not_logged(skipped, "")
+            );
+        }
+        self.rest.start(now);
+    }
+}
+
+/// Reads one family's socket until it is empty, or for `READ_BURST`
+/// packets, handing each to the responder. `faulty`: the wait reported an
+/// error condition, so finding nothing at all is a failure too; otherwise a
+/// condition the read does not clear would end every wait at once.
+fn receive(
+    net: &mut Net,
+    responder: &mut Responder,
+    family: Family,
+    health: &mut Health,
+    faulty: bool,
+    buf: &mut [u8],
+    now: &impl Fn() -> u64,
+) -> Result<(), Conflict> {
+    for read in 0..READ_BURST {
+        let received = match net.recv(family, buf) {
+            Ok(Receive::Empty) if faulty && read == 0 => {
+                Err(io::Error::other("the socket reports an error"))
+            }
+            received => received,
+        };
+        log_net(net);
+        match received {
+            Ok(got) => {
+                health.recovered(family);
+                match got {
+                    Receive::Packet(got) => {
+                        // A conflict ends the program: the name is someone
+                        // else's.
+                        let step =
+                            responder.handle(&buf[..got.len], got.link, got.source, now())?;
+                        dispatch(net, responder, step, now());
+                    }
+                    Receive::Ignored => {}
+                    Receive::Empty => break,
+                }
+            }
+            Err(e) => {
+                health.failed(family, &e, now());
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -172,7 +268,7 @@ fn rescan(net: &mut Net, responder: &mut Responder, now: u64) {
             };
             eprintln!("mdns-alias: addresses on {name}: {list}");
         }
-        dispatch(net, responder, change.step);
+        dispatch(net, responder, change.step, now);
     }
     if net.is_empty() {
         eprintln!("mdns-alias: no usable interfaces yet");
@@ -221,7 +317,7 @@ fn apply(scan: Rescan, responder: &mut Responder, now: u64) -> Vec<Change> {
     changes
 }
 
-fn dispatch(net: &mut Net, responder: &mut Responder, step: Step) {
+fn dispatch(net: &mut Net, responder: &mut Responder, step: Step, now: u64) {
     for notice in step.notices {
         match notice {
             Notice::Announced(link) => eprintln!("mdns-alias: announced on {}", net.describe(link)),
@@ -242,6 +338,18 @@ fn dispatch(net: &mut Net, responder: &mut Responder, step: Step) {
         }
         match net.send(&out) {
             Ok(()) => {}
+            // The socket does not wait for room in its send buffer: this
+            // packet is lost, but the link is fine.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(skipped) = net.send_dropped(out.link.family, now) {
+                    eprintln!(
+                        "mdns-alias: send buffer full on {}, dropped a packet{}; \
+                         logging again at most once a minute",
+                        net.describe(out.link),
+                        not_logged(skipped, "")
+                    );
+                }
+            }
             Err(e) if out.failure_breaks_link() => {
                 eprintln!(
                     "mdns-alias: sending on {} failed, dropping it until the next rescan: {e}",
@@ -261,7 +369,7 @@ fn dispatch(net: &mut Net, responder: &mut Responder, step: Step) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, not_logged};
+    use super::{apply, not_logged, timeout};
     use crate::net::IfIndex;
     use crate::net::Rescan;
     use crate::responder::{Family, Link, Mode, Outgoing, Responder};
@@ -275,6 +383,43 @@ mod tests {
         assert_eq!(not_logged(3, "failure"), " (3 more failures not logged)");
         assert_eq!(not_logged(0, ""), "");
         assert_eq!(not_logged(2, ""), " (2 more not logged)");
+    }
+
+    #[test]
+    fn the_wait_ends_at_the_earliest_timer() {
+        // Idle: until the next rescan.
+        assert_eq!(timeout(1_000, 300_000, []), 299_000);
+        assert_eq!(timeout(1_000, 300_000, [None, None, None, None]), 299_000);
+        // Any sooner timer wins: a send, a settled burst, a rest's end.
+        assert_eq!(timeout(1_000, 300_000, [Some(1_250), None]), 250);
+        assert_eq!(timeout(1_000, 300_000, [Some(5_000), Some(1_100)]), 100);
+        // A later one does not.
+        assert_eq!(timeout(1_000, 2_000, [Some(9_000)]), 1_000);
+        // Due or overdue: no wait at all.
+        assert_eq!(timeout(1_000, 300_000, [Some(1_000)]), 0);
+        assert_eq!(timeout(1_000, 300_000, [Some(0)]), 0);
+        assert_eq!(timeout(1_000, 500, []), 0);
+    }
+
+    /// The wait relies on this: were anything left due after a poll, the
+    /// loop would never sleep.
+    #[test]
+    fn nothing_is_left_due_after_a_poll() {
+        let mut r = responder();
+        apply(scan(&[V4, V6], &[], &[(2, &["192.0.2.10"])]), &mut r, 0);
+        let mut woke = 0;
+        let mut at = 0;
+        while let Some(due) = r.next_due() {
+            assert!(due >= at, "{due} is before {at}");
+            at = due;
+            r.poll(at);
+            assert!(r.next_due().is_none_or(|next| next > at), "{at}");
+            woke += 1;
+        }
+        // Waking only when due: the probes and announcements on two links,
+        // with no idle wakeups between them.
+        assert!((2..=20).contains(&woke), "{woke}");
+        assert!(run(&mut r, at, at + 10_000).is_empty());
     }
 
     const V4: Link = Link {

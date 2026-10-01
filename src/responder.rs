@@ -35,6 +35,26 @@ const TIEBREAK_BACKOFF: u64 = 1000;
 /// back and may be read after the address is gone; that copy is not a
 /// conflict.
 const RETIRED_GRACE: u64 = 5000;
+/// Shortest wait before answering a query with the TC bit set, which says
+/// more known answers follow (RFC 6762 sections 6 and 7.2). The wait is
+/// this plus up to `DEFER_SPREAD`, at random.
+const DEFER_MIN: u64 = 400;
+const DEFER_SPREAD: u64 = 100;
+/// Longest a deferred answer waits after the first packet, however many
+/// further TC packets extend the wait. This departs on purpose from RFC 6762
+/// section 7.2, which says to keep extending the delay while TC packets
+/// keep coming and accepts the delay that brings: the cap bounds how long a
+/// querier's state lives here. A packet arriving at or after the cap starts
+/// a fresh deferral rather than joining the old one.
+const DEFER_CAP: u64 = 2000;
+/// Deferred queries kept per link. A TC query beyond this is answered at
+/// once, as one without TC is.
+const MAX_DEFERRED: usize = 32;
+/// Questions and known answers about our aliases kept per deferred query.
+/// More are dropped: a dropped question goes unanswered until asked again,
+/// and a dropped known answer only costs a record the querier already has.
+const MAX_DEFERRED_QUESTIONS: usize = 32;
+const MAX_DEFERRED_KNOWN: usize = 64;
 
 /// How the aliases are published.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,9 +170,27 @@ enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AliasId(usize);
 
+/// A query with the TC bit set, waiting for the rest of its querier's known
+/// answers (RFC 6762 section 7.2).
+#[derive(Debug)]
+struct Deferred {
+    /// The querier, which later packets are matched to by address. The port
+    /// is always 5353: legacy queries are never deferred.
+    source: SocketAddr,
+    /// The questions and known answers about our aliases so far, from every
+    /// packet of the querier's; nothing else.
+    query: Message,
+    /// When the first packet arrived, which `DEFER_CAP` counts from.
+    first: u64,
+    due: u64,
+}
+
 #[derive(Debug)]
 struct LinkState {
     phase: Phase,
+    /// Queries waiting for more known answers, at most `MAX_DEFERRED`, at
+    /// most one per querier address, in arrival order.
+    deferred: Vec<Deferred>,
     /// When each record set (alias, type) was last multicast here.
     last_multicast: Vec<((AliasId, RType), u64)>,
     /// Aliases already reported as too big for one packet here.
@@ -163,6 +201,7 @@ impl LinkState {
     fn new(phase: Phase) -> LinkState {
         LinkState {
             phase,
+            deferred: Vec::new(),
             last_multicast: Vec::new(),
             oversized: Vec::new(),
         }
@@ -332,8 +371,11 @@ impl Records {
                     types.is_empty() || types.iter().any(|t| !matches!(t, RType::A | RType::AAAA))
                 }
                 RData::Cname(_) => true,
-                RData::Other { rtype, .. } => {
-                    matches!(*rtype, RType::A | RType::AAAA | RType::NSEC | RType::CNAME)
+                RData::Other(raw) => {
+                    matches!(
+                        raw.rtype(),
+                        RType::A | RType::AAAA | RType::NSEC | RType::CNAME
+                    )
                 }
             },
         }
@@ -398,9 +440,10 @@ fn retired(records: &Records, old: &[IpAddr], new: &[IpAddr]) -> Vec<Vec<u8>> {
         .filter_map(|(id, _)| {
             // Both sets are built here from the same names, so equal data
             // (which includes the type) means the same record. Only address
-            // mode gets here (set_addresses returns first in CNAME mode), so
-            // no CNAME targets are compared, and NSEC data compares as sets:
-            // Types are always sorted and without duplicates.
+            // mode gets here (set_addresses returns before reaching here in
+            // CNAME mode), so no CNAME targets are compared, and NSEC data
+            // compares as sets: Types are always sorted and without
+            // duplicates.
             let kept: Vec<RData> = records
                 .set(id, new, TTL, true)
                 .into_iter()
@@ -663,6 +706,7 @@ impl Responder {
         self.links.insert(link, LinkState::new(phase));
     }
 
+    /// Forgets `link`, with any answers deferred there.
     pub fn remove_link(&mut self, link: Link) {
         self.links.remove(&link);
     }
@@ -730,7 +774,7 @@ impl Responder {
         step
     }
 
-    /// Sends whatever probe or announcement has come due.
+    /// Sends whatever probe, announcement or deferred answer has come due.
     pub fn poll(&mut self, now: u64) -> Step {
         let mut step = Step::default();
         for (&link, state) in &mut self.links {
@@ -770,7 +814,37 @@ impl Responder {
             step.sends
                 .extend(msgs.into_iter().map(|p| multicast(link, p)));
         }
+        let mut ready = Vec::new();
+        for (&link, state) in &mut self.links {
+            let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.deferred)
+                .into_iter()
+                .partition(|d| now >= d.due);
+            state.deferred = waiting;
+            ready.extend(due.into_iter().map(|d| (link, d)));
+        }
+        for (link, d) in ready {
+            self.answer(&d.query, link, d.source, now, &mut step);
+        }
         step
+    }
+
+    /// When `poll` next has something to send: the earliest probe,
+    /// announcement or deferred answer due on any link, which may already
+    /// have passed. `None` while nothing is scheduled; only `handle`,
+    /// `add_link` and `set_addresses` schedule more.
+    pub fn next_due(&self) -> Option<u64> {
+        self.links
+            .values()
+            .flat_map(|state| {
+                let phase = match state.phase {
+                    Phase::Probing { due, .. } | Phase::Announcing { due } => Some(due),
+                    Phase::Waiting | Phase::Announced => None,
+                };
+                phase
+                    .into_iter()
+                    .chain(state.deferred.iter().map(|d| d.due))
+            })
+            .min()
     }
 
     /// Handles one received packet. Packets on links we do not serve, and
@@ -797,7 +871,9 @@ impl Responder {
             }
         } else {
             self.tiebreak(&msg, link, now, &mut step);
-            self.answer(&msg, link, source, now, &mut step);
+            if !self.defer(&msg, link, source, now) {
+                self.answer(&msg, link, source, now, &mut step);
+            }
         }
         Ok(step)
     }
@@ -903,6 +979,79 @@ impl Responder {
         }
     }
 
+    /// Multipacket known-answer suppression (RFC 6762 section 7.2): a query
+    /// with TC set is held for a random 400-500 ms, gathering the known
+    /// answers that follow from the same querier, and `poll` answers it
+    /// then. Returns whether `msg` was taken in here; if not, it is to be
+    /// answered now.
+    ///
+    /// A new deferral needs TC and a question about one of our aliases, and
+    /// room on the link. Once a querier has one, every later query of its on
+    /// the link joins it: its known answers count against all the
+    /// questions, its questions are answered with the rest, and with TC
+    /// again the wait is extended to 400-500 ms past it, but never past
+    /// `DEFER_CAP` after the first packet; from then on, the querier's
+    /// packets are treated as if it had none. Probes are answered at once,
+    /// and legacy queriers (RFC 6762 section 6.7) send no continuations, so
+    /// neither is deferred or joins. The jitter is drawn only for a TC
+    /// packet that is taken in.
+    fn defer(&mut self, msg: &Message, link: Link, source: SocketAddr, now: u64) -> bool {
+        if !msg.authorities.is_empty() || source.port() != MDNS_PORT {
+            return false;
+        }
+        let records = &self.records;
+        let Some(state) = self.links.get_mut(&link) else {
+            return false;
+        };
+        let joined = state
+            .deferred
+            .iter()
+            .position(|d| d.source.ip() == source.ip() && now < d.first + DEFER_CAP);
+        let at = match joined {
+            Some(at) => at,
+            None => {
+                let ours = msg
+                    .questions
+                    .iter()
+                    .any(|q| records.alias_index(&q.name).is_some());
+                if !msg.truncated || !ours || state.deferred.len() >= MAX_DEFERRED {
+                    return false;
+                }
+                state.deferred.push(Deferred {
+                    source,
+                    query: Message::default(),
+                    first: now,
+                    due: now,
+                });
+                state.deferred.len() - 1
+            }
+        };
+        let entry = &mut state.deferred[at];
+        if msg.truncated {
+            let wait = DEFER_MIN + xorshift(&mut self.rng, DEFER_SPREAD + 1);
+            let due = (now + wait).min(entry.first + DEFER_CAP);
+            entry.due = entry.due.max(due);
+        }
+        let query = &mut entry.query;
+        for q in &msg.questions {
+            if records.alias_index(&q.name).is_some()
+                && query.questions.len() < MAX_DEFERRED_QUESTIONS
+                && !query.questions.contains(q)
+            {
+                query.questions.push(q.clone());
+            }
+        }
+        for known in &msg.answers {
+            if records.alias_index(&known.name).is_some()
+                && query.answers.len() < MAX_DEFERRED_KNOWN
+                && !query.answers.contains(known)
+            {
+                query.answers.push(known.clone());
+            }
+        }
+        true
+    }
+
     /// Answers a query about our aliases: collect the records, drop those
     /// the querier knows, rate-limit multicasts, and pack what is left.
     fn answer(&mut self, msg: &Message, link: Link, source: SocketAddr, now: u64, step: &mut Step) {
@@ -971,11 +1120,18 @@ impl Responder {
 
     /// A number below `bound`. Jitter only: a little modulo bias is fine.
     fn random(&mut self, bound: u64) -> u64 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        self.rng % bound
+        xorshift(&mut self.rng, bound)
     }
+}
+
+/// Steps the xorshift64 state `rng` and returns a number below `bound`. A
+/// function of the state alone, so it can run while other fields of the
+/// `Responder` are borrowed.
+fn xorshift(rng: &mut u64, bound: u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng % bound
 }
 
 /// A record as RFC 6762 section 8.2 compares them: class, then type, then
@@ -1876,10 +2032,7 @@ mod tests {
     fn other_types_for_an_alias_are_not_conflicts() {
         let mut r = announced_with(&["192.0.2.10"]);
         let txt = Record {
-            rdata: RData::Other {
-                rtype: RType(16),
-                bytes: vec![1, b'x'],
-            },
+            rdata: RData::other(RType(16), vec![1, b'x']).unwrap(),
             ..a("192.0.2.10", TTL, true)
         };
         assert!(hear(&mut r, &response(vec![txt]), 5000).is_ok());
@@ -1889,20 +2042,14 @@ mod tests {
     fn an_address_record_of_the_wrong_length_is_a_conflict() {
         let mut r = announced_with(&["192.0.2.10"]);
         let short = Record {
-            rdata: RData::Other {
-                rtype: RType::A,
-                bytes: vec![192, 0, 2],
-            },
+            rdata: RData::other(RType::A, vec![192, 0, 2]).unwrap(),
             ..a("192.0.2.10", TTL, true)
         };
         let msg = response(vec![short]);
         let parsed = wire::parse(&wire::encode(&msg)).unwrap();
         assert!(matches!(
             parsed.answers[0].rdata,
-            RData::Other {
-                rtype: RType::A,
-                ..
-            }
+            RData::Other(ref raw) if raw.rtype() == RType::A
         ));
         assert!(hear(&mut r, &msg, 5000).is_err());
     }
@@ -2188,10 +2335,7 @@ mod tests {
         // suppresses nothing.
         let mut records = ours();
         let other_type = Record {
-            rdata: RData::Other {
-                rtype: RType(16),
-                bytes: vec![192, 0, 2, 10],
-            },
+            rdata: RData::other(RType(16), vec![192, 0, 2, 10]).unwrap(),
             ..a("192.0.2.10", TTL, false)
         };
         let other_alias = Record {
@@ -2308,5 +2452,334 @@ mod tests {
         let step = r.set_addresses(IfIndex::of(2), Vec::new(), 6000);
         assert!(step.sends.is_empty());
         assert!(matches!(r.links[&V4].phase, Phase::Announced));
+    }
+
+    /// `query` with the TC bit set: more known answers follow.
+    fn truncated(questions: &[(&str, RType, bool)]) -> Message {
+        Message {
+            truncated: true,
+            ..query(questions)
+        }
+    }
+
+    /// A continuation packet: known answers only, with TC if `more` follow.
+    fn continuation(known: Vec<Record>, more: bool) -> Message {
+        Message {
+            truncated: more,
+            answers: known,
+            ..Message::default()
+        }
+    }
+
+    fn querier(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)), MDNS_PORT)
+    }
+
+    #[test]
+    fn a_truncated_query_is_answered_400_to_500_ms_later() {
+        let mut times = BTreeSet::new();
+        for seed in 0..50 {
+            let mut r = Responder::new(vec![name(ALIAS)], Mode::Cname(name(TARGET)), seed);
+            announced(&mut r, V4);
+            let q = truncated(&[(ALIAS, RType::A, false)]);
+            assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+            let (sent, _) = run(&mut r, 10_000, 11_000);
+            assert_eq!(sent.len(), 1);
+            let (at, out) = &sent[0];
+            assert!((10_400..=10_500).contains(at), "answered at {at}");
+            assert_eq!(out.dest, Dest::Multicast);
+            assert_eq!(decode(out).answers, [cname(TTL, true)]);
+            times.insert(*at);
+        }
+        assert!(times.len() > 10, "waits are not spread out: {times:?}");
+    }
+
+    #[test]
+    fn a_deferred_unicast_question_is_answered_to_the_querier() {
+        let mut r = announced_responder();
+        assert!(
+            ask(
+                &mut r,
+                &truncated(&[(ALIAS, RType::A, true)]),
+                CLIENT,
+                10_000
+            )
+            .is_empty()
+        );
+        let (sent, _) = run(&mut r, 10_000, 11_000);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.dest, Dest::Unicast(CLIENT));
+    }
+
+    #[test]
+    fn known_answers_that_follow_from_the_querier_suppress_records() {
+        let mut r = announced_with(&["192.0.2.10", "192.0.2.11"]);
+        let mut q = truncated(&[(ALIAS, RType::A, false)]);
+        q.answers = vec![a("192.0.2.10", TTL, false)];
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        assert!(run(&mut r, 10_000, 10_099).0.is_empty());
+        let more = continuation(vec![a("192.0.2.11", TTL, false)], false);
+        assert!(ask(&mut r, &more, CLIENT, 10_100).is_empty());
+        // Both addresses are known between the two packets: nothing to say.
+        assert!(run(&mut r, 10_100, 11_000).0.is_empty());
+        assert_eq!(r.next_due(), None);
+
+        let mut r = announced_with(&["192.0.2.10", "192.0.2.11"]);
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        assert!(run(&mut r, 10_000, 10_099).0.is_empty());
+        let more = continuation(vec![a("192.0.2.11", TTL, false)], false);
+        assert!(ask(&mut r, &more, CLIENT, 10_100).is_empty());
+        let (sent, _) = run(&mut r, 10_100, 11_000);
+        let msg = one(sent.into_iter().map(|(_, o)| o).collect());
+        assert_eq!(msg.answers, [a("192.0.2.10", TTL, true)]);
+    }
+
+    #[test]
+    fn known_answers_from_another_querier_suppress_nothing() {
+        let mut r = announced_with(&["192.0.2.10", "192.0.2.11"]);
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        let more = continuation(vec![a("192.0.2.11", TTL, false)], false);
+        assert!(ask(&mut r, &more, OTHER, 10_100).is_empty());
+        let (sent, _) = run(&mut r, 10_000, 11_000);
+        let msg = one(sent.into_iter().map(|(_, o)| o).collect());
+        assert_eq!(
+            msg.answers,
+            [a("192.0.2.10", TTL, true), a("192.0.2.11", TTL, true)]
+        );
+    }
+
+    #[test]
+    fn another_truncated_packet_extends_the_wait() {
+        let mut r = announced_responder();
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        assert!(run(&mut r, 10_000, 10_399).0.is_empty());
+        let more = continuation(Vec::new(), true);
+        assert!(ask(&mut r, &more, CLIENT, 10_399).is_empty());
+        assert!(run(&mut r, 10_399, 10_798).0.is_empty());
+        let (sent, _) = run(&mut r, 10_799, 11_500);
+        assert_eq!(sent.len(), 1);
+        assert!((10_799..=10_899).contains(&sent[0].0), "{}", sent[0].0);
+    }
+
+    #[test]
+    fn a_stream_of_truncated_packets_delays_the_answer_two_seconds_at_most() {
+        let mut r = announced_responder();
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        let mut sent = Vec::new();
+        for t in (10_300..=13_000).step_by(300) {
+            sent.extend(run(&mut r, t - 300, t - 1).0);
+            let more = continuation(Vec::new(), true);
+            assert!(ask(&mut r, &more, CLIENT, t).is_empty());
+        }
+        let times: Vec<u64> = sent.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, [10_000 + DEFER_CAP]);
+    }
+
+    #[test]
+    fn a_query_without_tc_is_answered_at_once_and_nothing_waits() {
+        let mut r = announced_responder();
+        let q = query(&[(ALIAS, RType::A, false)]);
+        assert_eq!(ask(&mut r, &q, CLIENT, 10_000).len(), 1);
+        assert_eq!(r.next_due(), None);
+    }
+
+    #[test]
+    fn a_truncated_probe_is_answered_and_tiebroken_at_once() {
+        let mut r = announced_responder();
+        let mut probe = their_probe("elsewhere.local");
+        probe.truncated = true;
+        assert_eq!(ask(&mut r, &probe, CLIENT, 10_000).len(), 1);
+        assert_eq!(r.next_due(), None);
+
+        let mut r = responder();
+        r.add_link(V4, 0);
+        run(&mut r, 0, 250);
+        let mut probe = their_probe("some-longer-host.local");
+        probe.truncated = true;
+        let step = hear(&mut r, &probe, 251).unwrap();
+        assert_eq!(step.notices, [Notice::TiebreakLost(V4)]);
+        assert!(r.links[&V4].deferred.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_legacy_query_is_answered_at_once() {
+        let mut r = announced_responder();
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        let sent = ask(&mut r, &q, LEGACY, 10_000);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].dest, Dest::Unicast(LEGACY));
+        assert_eq!(r.next_due(), None);
+    }
+
+    #[test]
+    fn a_truncated_query_about_other_names_is_not_held() {
+        let mut r = announced_responder();
+        let q = truncated(&[("other.local", RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        assert_eq!(r.next_due(), None);
+    }
+
+    #[test]
+    fn deferred_queries_are_bounded_per_link() {
+        let mut r = announced_responder();
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        for i in 0..MAX_DEFERRED {
+            let source = querier(100 + i as u8);
+            assert!(ask(&mut r, &q, source, 10_000).is_empty());
+        }
+        assert_eq!(r.links[&V4].deferred.len(), MAX_DEFERRED);
+        // One more is answered at once, as without TC.
+        assert_eq!(ask(&mut r, &q, OTHER, 10_000).len(), 1);
+        assert_eq!(r.links[&V4].deferred.len(), MAX_DEFERRED);
+        // A querier already waiting still adds to its own entry.
+        let more = continuation(vec![cname(TTL, false)], false);
+        assert!(ask(&mut r, &more, querier(100), 10_100).is_empty());
+        assert_eq!(r.links[&V4].deferred[0].query.answers, [cname(TTL, false)]);
+    }
+
+    #[test]
+    fn questions_and_known_answers_kept_per_deferred_query_are_bounded() {
+        // Below the caps, a packet sent twice is kept once.
+        let mut r = announced_responder();
+        let mut small = truncated(&[(ALIAS, RType::A, false), (ALIAS, RType::AAAA, false)]);
+        small.answers = vec![cname(TTL, false), a_record(ALIAS, TTL)];
+        assert!(ask(&mut r, &small, CLIENT, 10_000).is_empty());
+        assert!(ask(&mut r, &small, CLIENT, 10_100).is_empty());
+        let kept = &r.links[&V4].deferred[0].query;
+        assert_eq!(kept.questions, small.questions);
+        assert_eq!(kept.answers, small.answers);
+
+        let mut r = announced_responder();
+        let mut q = truncated(&[("other.local", RType::A, false)]);
+        q.questions
+            .extend((0..=MAX_DEFERRED_QUESTIONS).map(|i| Question {
+                name: name(ALIAS),
+                qtype: RType(1000 + i as u16),
+                qclass: Class::IN,
+                unicast_response: false,
+            }));
+        q.answers = (0..=MAX_DEFERRED_KNOWN)
+            .map(|i| Record {
+                rdata: RData::A(Ipv4Addr::new(192, 0, 2, i as u8)),
+                ..cname(TTL, false)
+            })
+            .collect();
+        q.answers.insert(0, a_record("other.local", TTL));
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        // The same packet again adds nothing new.
+        assert!(ask(&mut r, &q, CLIENT, 10_100).is_empty());
+        let kept = &r.links[&V4].deferred[0].query;
+        assert_eq!(kept.questions.len(), MAX_DEFERRED_QUESTIONS);
+        assert!(kept.questions.iter().all(|q| q.name == name(ALIAS)));
+        assert_eq!(kept.answers.len(), MAX_DEFERRED_KNOWN);
+        assert!(kept.answers.iter().all(|k| k.name == name(ALIAS)));
+    }
+
+    #[test]
+    fn another_query_from_a_waiting_querier_is_answered_with_it() {
+        let mut r = announced_with(&["192.0.2.10", "2001:db8::10"]);
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        let due = r.links[&V4].deferred[0].due;
+        assert!(run(&mut r, 10_000, 10_049).0.is_empty());
+        let other = query(&[(ALIAS, RType::AAAA, false)]);
+        assert!(ask(&mut r, &other, CLIENT, 10_050).is_empty());
+        assert_eq!(r.links[&V4].deferred[0].due, due);
+        let (sent, _) = run(&mut r, 10_050, 11_000);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, due);
+        let msg = decode(&sent[0].1);
+        assert_eq!(
+            msg.answers,
+            [a("192.0.2.10", TTL, true), aaaa("2001:db8::10", TTL, true)]
+        );
+        assert!(msg.additionals.is_empty());
+    }
+
+    #[test]
+    fn a_packet_at_the_cap_starts_afresh_instead_of_joining() {
+        let mut r = announced_responder();
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        // No poll since: the first entry is past due but still held. A
+        // packet at the cap knows the answer, yet must not suppress it.
+        let mut knows = truncated(&[(ALIAS, RType::A, false)]);
+        knows.answers = vec![cname(TTL, false)];
+        let at_cap = 10_000 + DEFER_CAP;
+        assert!(ask(&mut r, &knows, CLIENT, at_cap).is_empty());
+        let deferred = &r.links[&V4].deferred;
+        assert_eq!(deferred.len(), 2);
+        assert!(deferred[0].query.answers.is_empty());
+        assert_eq!(deferred[1].first, at_cap);
+        assert_eq!(deferred[1].query.answers, [cname(TTL, false)]);
+        let (sent, _) = run(&mut r, at_cap, at_cap + 1000);
+        let times: Vec<u64> = sent.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, [at_cap]);
+        assert_eq!(decode(&sent[0].1).answers, [cname(TTL, true)]);
+        assert_eq!(r.next_due(), None);
+    }
+
+    #[test]
+    fn a_truncated_query_about_other_names_draws_no_jitter() {
+        let mut r = announced_responder();
+        let before = r.rng;
+        let q = truncated(&[("other.local", RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        assert_eq!(r.rng, before);
+    }
+
+    #[test]
+    fn removing_a_link_drops_its_deferred_answers() {
+        let mut r = announced_responder();
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        assert!(r.next_due().is_some());
+        r.remove_link(V4);
+        assert_eq!(r.next_due(), None);
+        r.add_link(V4, 10_100);
+        assert!(r.links[&V4].deferred.is_empty());
+        let (sent, _) = run(&mut r, 10_100, 11_000);
+        assert!(sent.iter().all(|(_, o)| !decode(o).is_response));
+    }
+
+    #[test]
+    fn next_due_covers_probes_announcements_and_deferred_answers() {
+        let mut r = responder();
+        assert_eq!(r.next_due(), None);
+        r.add_link(V4, 0);
+        // Polling only when next_due says sends every probe and
+        // announcement on time.
+        let first = r.next_due().unwrap();
+        assert!(first <= PROBE_WAIT_MAX);
+        let mut times = Vec::new();
+        let mut now = first;
+        loop {
+            assert!(!r.poll(now).sends.is_empty(), "nothing sent at {now}");
+            times.push(now);
+            let Some(next) = r.next_due() else { break };
+            assert!(next > now);
+            now = next;
+        }
+        assert_eq!(
+            times,
+            [first, first + 250, first + 500, first + 750, first + 1750]
+        );
+
+        let q = truncated(&[(ALIAS, RType::A, false)]);
+        assert!(ask(&mut r, &q, CLIENT, 10_000).is_empty());
+        let deferred = r.next_due().unwrap();
+        assert!((10_400..=10_500).contains(&deferred));
+        // A probe due sooner on another link comes first.
+        r.add_link(V4B, 10_000);
+        assert!(r.next_due().unwrap() <= 10_000 + PROBE_WAIT_MAX);
+        r.remove_link(V4B);
+        assert_eq!(r.next_due(), Some(deferred));
+        assert!(r.poll(deferred - 1).sends.is_empty());
+        assert_eq!(r.poll(deferred).sends.len(), 1);
+        assert_eq!(r.next_due(), None);
     }
 }

@@ -61,7 +61,7 @@ impl Rule {
 
 /// The program buffer, in a module of its own so that only its methods write
 /// its fields.
-mod program {
+mod buffer {
     use super::{
         Insn, JEQ_K, JSET_K, LD_W_ABS, RET_ALLOW, RET_KILL_PROCESS, Value, arg_offset, ins, jump,
         ret,
@@ -152,7 +152,7 @@ mod program {
         }
     }
 }
-use program::Program;
+use buffer::Program;
 
 /// How many instructions a rule's body takes; every body ends in a return.
 const fn body_len(rule: &Rule) -> usize {
@@ -343,11 +343,17 @@ const ALLOWLIST: &[Rule] = &[
     // clock source cannot be read from user space, as on some VMs. No
     // futex: the process is single-threaded, so no lock ever waits.
     Rule::Any(libc::SYS_clock_gettime),
-    // Waiting out a failed receive: thread::sleep is clock_nanosleep on the
-    // monotonic clock, relative (flags 0). The plain nanosleep is not used.
+    // Waiting for a packet, a notification, a signal or the next timer:
+    // sys::poll, always over the same number of entries and with no signal
+    // mask (null, size 0). ppoll, since aarch64 has no plain poll. Nothing
+    // sleeps: a socket that keeps failing is left out of the wait instead.
     Rule::Args {
-        nr: libc::SYS_clock_nanosleep,
-        alternatives: &[&[(0, v(libc::CLOCK_MONOTONIC)), (1, Value::Is(0))]],
+        nr: libc::SYS_ppoll,
+        alternatives: &[&[
+            (1, Value::Is(crate::sys::POLL_FDS as u64)),
+            (3, Value::Is(0)),
+            (4, Value::Is(0)),
+        ]],
     },
     // A panic reporting itself and aborting: abort() blocks signals and
     // raises SIGABRT at this thread only. The hook also prints the thread
@@ -457,28 +463,31 @@ pub fn landlock_ruleset(abi: u32) -> Landlock {
     }
 }
 
-/// One layer of the lockdown, named as the log names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Layer {
+/// Defines `Layer` and `Layer::ALL` from one list, so a variant cannot exist
+/// without being in `ALL`.
+macro_rules! layers {
+    ($($variant:ident),+ $(,)?) => {
+        /// One layer of the lockdown, named as the log names it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Layer {
+            $($variant),+
+        }
+
+        impl Layer {
+            /// Every layer, in the order the lockdown applies them.
+            pub const ALL: [Layer; [$(Layer::$variant),+].len()] = [$(Layer::$variant),+];
+        }
+    };
+}
+
+layers!(
     Rlimits,
     AddressSpace,
     NonDumpable,
     NoNewPrivs,
     Landlock,
-    Seccomp,
-}
-
-impl Layer {
-    /// Every layer, in the order the lockdown applies them.
-    pub const ALL: [Layer; 6] = [
-        Layer::Rlimits,
-        Layer::AddressSpace,
-        Layer::NonDumpable,
-        Layer::NoNewPrivs,
-        Layer::Landlock,
-        Layer::Seccomp,
-    ];
-}
+    Seccomp
+);
 
 impl fmt::Display for Layer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -840,13 +849,26 @@ mod tests {
             0,
         ];
         assert_eq!(call(libc::SYS_recvmsg, [0; 6]), RET_ALLOW);
-        let sleep = |clock: i32, flags: u64| {
-            call(libc::SYS_clock_nanosleep, [clock as u64, flags, 0, 0, 0, 0])
-        };
-        assert_eq!(sleep(libc::CLOCK_MONOTONIC, 0), RET_ALLOW);
-        assert_eq!(sleep(libc::CLOCK_REALTIME, 0), RET_KILL_PROCESS);
-        assert_eq!(sleep(libc::CLOCK_MONOTONIC, 1), RET_KILL_PROCESS);
+        // No sleeping: the wait's timeout is the only timer.
+        let monotonic = libc::CLOCK_MONOTONIC as u64;
+        assert_eq!(
+            call(libc::SYS_clock_nanosleep, [monotonic, 0, 0, 0, 0, 0]),
+            RET_KILL_PROCESS
+        );
         assert_eq!(call(libc::SYS_nanosleep, [0; 6]), RET_KILL_PROCESS);
+        // The wait: its entry count, a null signal mask and size 0 only.
+        let fds = crate::sys::POLL_FDS as u64;
+        let ppoll = |nfds: u64, mask: u64, size: u64| {
+            call(libc::SYS_ppoll, [0x1000, nfds, 0x2000, mask, size, 0])
+        };
+        assert_eq!(ppoll(fds, 0, 0), RET_ALLOW);
+        assert_eq!(ppoll(fds + 1, 0, 0), RET_KILL_PROCESS);
+        assert_eq!(ppoll(fds, 0x3000, 8), RET_KILL_PROCESS);
+        assert_eq!(ppoll(fds, 0, 8), RET_KILL_PROCESS);
+        #[cfg(target_arch = "x86_64")]
+        for nr in [libc::SYS_poll, libc::SYS_select] {
+            assert_eq!(call(nr, [0; 6]), RET_KILL_PROCESS, "syscall {nr}");
+        }
         assert_eq!(call(libc::SYS_socket, netlink), RET_ALLOW);
         assert_eq!(
             call(libc::SYS_socket, [libc::AF_INET as u64, 2, 0, 0, 0, 0]),

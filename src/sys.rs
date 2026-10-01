@@ -6,6 +6,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::time::Duration;
 
 /// prctl reads its optional arguments as `unsigned long`; passing `int`s
 /// leaves their upper halves unspecified, and the kernel rejects
@@ -15,8 +16,9 @@ const ZERO: libc::c_ulong = 0;
 
 /// musl's syscall() reads six `long` arguments whatever the call; passing
 /// fewer, or narrower ones, leaves the rest unspecified. Every raw syscall
-/// goes through here with all six. Only for calls libc has no wrapper for:
-/// neither musl nor the libc crate wraps the Landlock calls.
+/// goes through here with all six. Only for calls libc has no wrapper for
+/// (neither musl nor the libc crate wraps the Landlock calls), or whose
+/// wrapper passes arguments the seccomp filter would rather pin (`poll`).
 ///
 /// # Safety
 ///
@@ -91,6 +93,53 @@ pub fn signal_pending(fd: BorrowedFd<'_>) -> bool {
     };
     // read returns -1 on error, which no usize matches.
     usize::try_from(read) == Ok(size)
+}
+
+/// How many entries `poll` takes: both mDNS sockets, the notification
+/// socket and the signalfd. An unused entry holds descriptor -1, which the
+/// kernel skips, so the count never varies and the seccomp filter pins it.
+pub const POLL_FDS: usize = 4;
+
+/// An entry for `poll` that waits for `fd` to be readable (or to report an
+/// error, which the kernel always reports); -1 for an unused entry.
+pub const fn poll_entry(fd: libc::c_int) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }
+}
+
+/// Waits until an entry of `fds` is ready or `timeout` passes, filling in
+/// each entry's `revents`, and returns how many are ready: 0 on a timeout.
+/// A signal that interrupts the wait is `ErrorKind::Interrupted`.
+///
+/// The ppoll system call itself, not musl's wrapper: there is no signal mask
+/// to set, so this passes a null mask and a mask size of 0, which the
+/// seccomp filter pins, where musl passes its signal-set size whatever the
+/// mask. ppoll rather than poll, because aarch64 has no poll system call.
+pub fn poll(fds: &mut [libc::pollfd; POLL_FDS], timeout: Duration) -> io::Result<usize> {
+    let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+    let mut ts = libc::timespec {
+        // time_t, 64-bit on every target the filter is built for.
+        tv_sec: i64::try_from(timeout.as_secs()).map_err(|_| invalid())?,
+        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+    };
+    let nfds = libc::c_long::try_from(fds.len()).map_err(|_| invalid())?;
+    // SAFETY: `fds` points at `nfds` live pollfd entries, which the kernel
+    // reads and whose `revents` it writes; `ts` is a live timespec, into
+    // which the kernel may write the time left. Both outlive the call. The
+    // signal mask is null, so its size, 0, is never used.
+    let ready = unsafe {
+        raw_syscall(
+            libc::SYS_ppoll,
+            [word(fds.as_mut_ptr()), nfds, word(&raw mut ts), 0, 0, 0],
+        )
+    };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(ready).map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
 #[derive(Clone, Copy, Debug)]

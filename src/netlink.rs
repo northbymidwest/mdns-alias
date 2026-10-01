@@ -237,6 +237,45 @@ pub struct Drained {
     pub changed: bool,
     /// The kernel dropped notifications: rescan now.
     pub overflow: bool,
+    /// A read failed, or found nothing where a message should be: rest the
+    /// socket, so one that stays readable cannot end every wait at once.
+    pub failed: bool,
+}
+
+/// `ENOBUFS` on Linux: the socket's buffer overflowed and notifications
+/// were lost.
+const ENOBUFS: i32 = 105;
+
+/// Adds one read of the notification socket, `read` (the bytes read, or the
+/// error), to `drained`; whether to read again. Anything unreadable counts
+/// as a change: a needless rescan is cheap, a missed change is not.
+fn absorb(drained: &mut Drained, read: std::io::Result<&[u8]>) -> bool {
+    use std::io::ErrorKind;
+
+    match read {
+        Ok([]) => {
+            drained.changed = true;
+            drained.failed = true;
+            false
+        }
+        Ok(bytes) => {
+            if messages(bytes, &mut |kind, _| drained.changed |= is_change(kind)).is_err() {
+                drained.changed = true;
+            }
+            true
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => false,
+        Err(e) if e.raw_os_error() == Some(ENOBUFS) => {
+            drained.overflow = true;
+            true
+        }
+        Err(e) if e.kind() == ErrorKind::Interrupted => true,
+        Err(_) => {
+            drained.changed = true;
+            drained.failed = true;
+            false
+        }
+    }
 }
 
 /// A non-blocking socket subscribed to link and address notifications.
@@ -260,33 +299,16 @@ pub fn subscribe() -> std::io::Result<socket2::Socket> {
     Ok(sock)
 }
 
-/// Reads every pending notification from `sock` without blocking.
-/// Anything unreadable counts as a change: a needless rescan is cheap, a
-/// missed change is not.
+/// Reads every pending notification from `sock` without blocking; see
+/// `absorb` for what each read adds.
 #[cfg(target_os = "linux")]
 pub fn drain(sock: &socket2::Socket, buf: &mut [u8]) -> Drained {
-    use std::io::{ErrorKind, Read};
+    use std::io::Read;
 
+    const _: () = assert!(ENOBUFS == libc::ENOBUFS);
     let mut drained = Drained::default();
     let mut reader = sock;
-    loop {
-        match reader.read(buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let parsed = messages(&buf[..n], &mut |kind, _| drained.changed |= is_change(kind));
-                if parsed.is_err() {
-                    drained.changed = true;
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => drained.overflow = true,
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => {
-                drained.changed = true;
-                break;
-            }
-        }
-    }
+    while absorb(&mut drained, reader.read(buf).map(|n| &buf[..n])) {}
     drained
 }
 
@@ -331,6 +353,26 @@ pub fn dump() -> std::io::Result<(Vec<LinkInfo>, Vec<AddrInfo>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draining_stops_and_flags_a_failure_on_errors_and_empty_reads() {
+        use std::io::{Error, ErrorKind};
+
+        let mut d = Drained::default();
+        assert!(!absorb(&mut d, Err(ErrorKind::WouldBlock.into())));
+        assert_eq!(d, Drained::default());
+        assert!(absorb(&mut d, Err(ErrorKind::Interrupted.into())));
+        assert_eq!(d, Drained::default());
+        // Lost notifications: rescan at once, but the socket is fine.
+        assert!(absorb(&mut d, Err(Error::from_raw_os_error(ENOBUFS))));
+        assert!(d.overflow && !d.failed && !d.changed);
+
+        for read in [Ok(&[][..]), Err(ErrorKind::ConnectionReset.into())] {
+            let mut d = Drained::default();
+            assert!(!absorb(&mut d, read));
+            assert!(d.failed && d.changed && !d.overflow, "{d:?}");
+        }
+    }
 
     /// One message: header, then payload, padded to 4 bytes.
     fn message(kind: u16, payload: &[u8]) -> Vec<u8> {

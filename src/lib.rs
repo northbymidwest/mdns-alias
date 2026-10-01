@@ -64,11 +64,13 @@ pub mod testing {
         pub use crate::sandbox::{lock_with, program};
     }
 
-    /// The raw calls the Linux tests make to apply one layer at a time.
+    /// The raw calls the Linux tests make to apply one layer at a time, and
+    /// the wait they make under the filter.
     #[cfg(target_os = "linux")]
     pub mod sys {
         pub use crate::sys::{
-            install_seccomp, landlock_abi, landlock_restrict, set_no_new_privs, thread_id,
+            POLL_FDS, install_seccomp, landlock_abi, landlock_restrict, poll, poll_entry,
+            set_no_new_privs, thread_id,
         };
     }
 }
