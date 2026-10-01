@@ -46,12 +46,12 @@ the addresses (or the CNAME, with `--cname`) as expected.
 ## Docker
 
 Released images are at `ghcr.io/northbymidwest/mdns-alias:<version>`, for
-`linux/amd64` and `linux/arm64`. The current release is `0.5.1`. `latest`
+`linux/amd64` and `linux/arm64`. The current release is `0.5.2`. `latest`
 follows the newest release; pin a version (or a digest) for anything you
 deploy. Each release carries build provenance and SBOM attestations:
 
 ```sh
-gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.5.1 \
+gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.5.2 \
   --owner northbymidwest
 ```
 
@@ -63,7 +63,7 @@ the default host name is right.
 ```yaml
 services:
   mdns-alias:
-    image: ghcr.io/northbymidwest/mdns-alias:0.5.1
+    image: ghcr.io/northbymidwest/mdns-alias:0.5.2
     network_mode: host
     command: ["app", "media"]
     read_only: true
