@@ -2,7 +2,7 @@
 //! with the host's own responder, joined to the mDNS group on each interface
 //! served.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
@@ -35,6 +35,9 @@ pub struct Net {
     /// Each served link's addresses and prefix lengths, for the source
     /// check. Replaced on every successful rescan.
     subnets: BTreeMap<Link, Vec<(IpAddr, u8)>>,
+    drops: DropLog,
+    /// Lines to log, collected by `take_log`.
+    log: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +102,8 @@ impl Net {
             joined: BTreeMap::new(),
             unserved: Vec::new(),
             subnets: BTreeMap::new(),
+            drops: DropLog::default(),
+            log: Vec::new(),
         };
         Ok((net, log))
     }
@@ -115,6 +120,7 @@ impl Net {
         };
         let want = wanted(&ifs, &self.only, &self.families());
         self.subnets = subnets(&ifs, &want);
+        self.drops.reset();
         let gone: Vec<Link> = self
             .joined
             .keys()
@@ -167,7 +173,7 @@ impl Net {
     }
 
     /// Waits up to 100 ms for a packet on one family's socket.
-    pub fn recv(&self, family: Family, buf: &mut [u8]) -> io::Result<Option<Received>> {
+    pub fn recv(&mut self, family: Family, buf: &mut [u8]) -> io::Result<Option<Received>> {
         let Ok(sock) = self.socket(family) else {
             return Ok(None);
         };
@@ -177,9 +183,24 @@ impl Net {
                 let index = u32::try_from(info.if_index).unwrap_or(0);
                 let link = Link { index, family };
                 // Off-link senders (RFC 6762 section 11), and anything on a
-                // link we do not serve, never reach the responder.
-                if !accepted(&self.subnets, link, info.addr_src.ip()) {
-                    return Ok(None);
+                // link we do not serve, never reach the responder. Off-link
+                // drops on a served link are logged once per rescan: a
+                // netmask that does not cover the LAN should not fail
+                // silently.
+                match verdict(&self.subnets, link, info.addr_src.ip()) {
+                    Verdict::Accept => {}
+                    Verdict::Unserved => return Ok(None),
+                    Verdict::OffLink => {
+                        if self.drops.first(link) {
+                            self.log.push(format!(
+                                "ignoring {} on {}: not on its subnets; further ones are \
+                                 ignored silently until the next rescan",
+                                info.addr_src.ip(),
+                                self.describe(link)
+                            ));
+                        }
+                        return Ok(None);
+                    }
                 }
                 Ok(Some(Received {
                     len,
@@ -257,6 +278,11 @@ impl Net {
             .map(|sock| sock.as_raw_fd())
             .max()
             .unwrap_or(-1)
+    }
+
+    /// Lines to log since the last call.
+    pub fn take_log(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.log)
     }
 
     pub fn serves(&self, link: Link) -> bool {
@@ -416,18 +442,49 @@ fn subnets(ifs: &[Interface], want: &BTreeMap<Link, Joined>) -> BTreeMap<Link, V
     out
 }
 
-/// Whether a packet from `source` on `link` may reach the responder: the
-/// link is served and the source is on-link there.
-fn accepted(subnets: &BTreeMap<Link, Vec<(IpAddr, u8)>>, link: Link, source: IpAddr) -> bool {
-    subnets.get(&link).is_some_and(|s| on_link(source, s))
+/// What to do with a packet from `source` on `link`.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Accept,
+    /// A link we do not serve: Linux delivers group traffic joined by any
+    /// socket to every one, so this is normal.
+    Unserved,
+    /// A served link, but the source is not on-link there.
+    OffLink,
+}
+
+fn verdict(subnets: &BTreeMap<Link, Vec<(IpAddr, u8)>>, link: Link, source: IpAddr) -> Verdict {
+    match subnets.get(&link) {
+        None => Verdict::Unserved,
+        Some(s) if on_link(source, s) => Verdict::Accept,
+        Some(_) => Verdict::OffLink,
+    }
+}
+
+/// The links that have logged an off-link drop since the last rescan.
+#[derive(Debug, Default)]
+struct DropLog(BTreeSet<Link>);
+
+impl DropLog {
+    /// Whether this is the first drop on `link` since the last reset.
+    fn first(&mut self, link: Link) -> bool {
+        self.0.insert(link)
+    }
+
+    fn reset(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// Whether `source` is on-link for an interface with these addresses:
-/// inside one of its subnets, or IPv6 link-local.
+/// inside one of its subnets, or link-local (169.254/16, fe80::/10), which
+/// RFC 6762 section 11 counts as on-link wherever it arrives.
 fn on_link(source: IpAddr, subnets: &[(IpAddr, u8)]) -> bool {
-    if let IpAddr::V6(v6) = source
-        && v6.is_unicast_link_local()
-    {
+    let link_local = match source {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    };
+    if link_local {
         return true;
     }
     subnets
@@ -636,6 +693,7 @@ mod tests {
             ("2001:db8::99", true),
             ("2001:db8:1::1", false),
             ("fe80::1234", true),
+            ("169.254.10.20", true),
             ("::1", false),
         ] {
             assert_eq!(
@@ -689,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn packets_on_unserved_links_are_never_accepted() {
+    fn packets_are_accepted_only_from_on_link_senders_on_served_links() {
         let ifs = [iface("enp1s0", 2, "192.0.2.10")];
         let subnets = subnets(&ifs, &wanted(&ifs, &[], &BOTH));
         let served = Link {
@@ -701,8 +759,27 @@ mod tests {
             family: Family::V4,
         };
         let source = "192.0.2.20".parse().unwrap();
-        assert!(accepted(&subnets, served, source));
-        assert!(!accepted(&subnets, other, source));
-        assert!(!accepted(&subnets, served, "198.51.100.7".parse().unwrap()));
+        assert_eq!(verdict(&subnets, served, source), Verdict::Accept);
+        assert_eq!(verdict(&subnets, other, source), Verdict::Unserved);
+        let far = "198.51.100.7".parse().unwrap();
+        assert_eq!(verdict(&subnets, served, far), Verdict::OffLink);
+    }
+
+    #[test]
+    fn off_link_drops_are_logged_once_per_link_per_rescan() {
+        let mut log = DropLog::default();
+        let a = Link {
+            index: 2,
+            family: Family::V4,
+        };
+        let b = Link {
+            index: 2,
+            family: Family::V6,
+        };
+        assert!(log.first(a));
+        assert!(!log.first(a));
+        assert!(log.first(b));
+        log.reset();
+        assert!(log.first(a));
     }
 }

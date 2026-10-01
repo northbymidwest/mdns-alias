@@ -1,13 +1,18 @@
-//! Behaviour that needs a real Linux kernel: signals here, and from Task 5
-//! the sandbox, applied in child processes.
+//! Behaviour that needs a real Linux kernel: signals, and the sandbox
+//! applied in child processes.
 
 #![cfg(target_os = "linux")]
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
+use mdns_alias::responder::Conflict;
 use mdns_alias::signals::Signals;
+use mdns_alias::wire::Name;
 use mdns_alias::{netlink, sandbox, sys};
+use socket_pktinfo::PktInfoUdpSocket;
+use socket2::{Domain, SockAddr};
 
 #[test]
 fn signalfd_reports_a_blocked_sigterm_once() {
@@ -51,8 +56,7 @@ fn in_child(test: &str) -> Option<ExitStatus> {
 
 fn seccomp() {
     sys::set_no_new_privs().unwrap();
-    let (arch, x32) = sandbox::arch().expect("tests run on x86_64 or aarch64");
-    sys::install_seccomp(&sandbox::compile(arch, x32, &sandbox::allowlist())).unwrap();
+    sys::install_seccomp(&sandbox::program(sys::thread_id())).unwrap();
 }
 
 fn assert_killed(status: ExitStatus) {
@@ -62,18 +66,85 @@ fn assert_killed(status: ExitStatus) {
 #[test]
 fn seccomp_allows_the_steady_state() {
     let Some(status) = in_child("seccomp_allows_the_steady_state") else {
+        // Sockets exist before lockdown, as in the real program.
+        let signals = Signals::new().unwrap();
+        let receiver = PktInfoUdpSocket::new(Domain::IPV4).unwrap();
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        receiver.bind(&SockAddr::from(local)).unwrap();
+        let to = receiver.try_clone_std().unwrap().local_addr().unwrap();
+        let sender = UdpSocket::bind(local).unwrap();
+        let v6 = PktInfoUdpSocket::new(Domain::IPV6).ok();
         seccomp();
-        let started = std::time::Instant::now();
+        // A rescan: the netlink dump, then joining and leaving groups. On
+        // loopback the joins may fail; the calls just must not be killed.
+        let rescanned = netlink::dump().is_ok();
+        let group = Ipv4Addr::new(224, 0, 0, 251);
+        let _ = receiver.join_multicast_v4(&group, &Ipv4Addr::LOCALHOST);
+        let _ = receiver.leave_multicast_v4(&group, &Ipv4Addr::LOCALHOST);
+        let _ = receiver.set_multicast_if_v4(&Ipv4Addr::LOCALHOST);
+        if let Some(v6) = &v6 {
+            let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+            let _ = v6.join_multicast_v6(&group, 1);
+            let _ = v6.leave_multicast_v6(&group, 1);
+            let _ = v6.set_multicast_if_v6(1);
+        }
+        // A packet out and back in, as replies and queries travel, and a
+        // send that fails, as to an unreachable querier.
+        sender.send_to(b"ping", to).unwrap();
+        let mut buf = [0u8; 16];
+        let got = receiver.recv(&mut buf).map_or(0, |(n, _)| n);
+        let _ = sender.send_to(b"x", (Ipv4Addr::BROADCAST, 9));
+        let quiet = !signals.pending();
         let buffer = vec![1u8; 1 << 20];
         std::hint::black_box(&buffer);
         drop(buffer);
-        let rescanned = netlink::dump().is_ok();
-        eprintln!("sandboxed child alive after {:?}", started.elapsed());
-        sys::exit_now(if rescanned { 0 } else { 3 });
+        eprintln!("sandboxed child: rescanned {rescanned}, received {got}");
+        sys::exit_now(if rescanned && got == 4 && quiet { 0 } else { 3 });
     };
     assert!(status.success(), "{status:?}");
 }
 
+#[test]
+fn seccomp_allows_an_error_exit() {
+    let Some(status) = in_child("seccomp_allows_an_error_exit") else {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        seccomp();
+        // As main does on a conflict: format and log the error, drop it and
+        // the sockets, and exit with status 1 through std's cleanup.
+        let error: Box<dyn std::error::Error> = Box::new(Conflict {
+            alias: Name::parse("app.myhost.local").unwrap(),
+            source: "192.0.2.30".parse().unwrap(),
+        });
+        eprintln!("mdns-alias: {error}");
+        drop(error);
+        drop(socket);
+        std::process::exit(1);
+    };
+    assert_eq!(status.code(), Some(1), "{status:?}");
+}
+
+/// The highest open descriptor, read before lockdown as the real program
+/// knows its own.
+fn highest_fd() -> i32 {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .max()
+        .unwrap()
+}
+
+#[test]
+fn full_lockdown_still_rescans() {
+    let Some(status) = in_child("full_lockdown_still_rescans") else {
+        let report = sandbox::lock(highest_fd());
+        let sealed = report.applied.iter().any(|a| a == "seccomp");
+        // Twice: the descriptor cap must leave room for the netlink socket
+        // on every rescan, not just the first.
+        let rescans = netlink::dump().is_ok() && netlink::dump().is_ok();
+        sys::exit_now(if sealed && rescans { 0 } else { 3 });
+    };
+    assert!(status.success(), "{status:?}");
+}
 #[test]
 fn seccomp_allows_a_normal_exit() {
     let Some(status) = in_child("seccomp_allows_a_normal_exit") else {
@@ -83,6 +154,30 @@ fn seccomp_allows_a_normal_exit() {
         std::process::exit(0);
     };
     assert!(status.success(), "{status:?}");
+}
+
+#[test]
+fn seccomp_lets_a_panic_report_itself() {
+    let log = std::env::temp_dir().join(format!("mdns-alias-panic-{}.log", std::process::id()));
+    let Some(status) = in_child_with("seccomp_lets_a_panic_report_itself", |c| {
+        c.stderr(std::fs::File::create(&log).unwrap());
+    }) else {
+        seccomp();
+        // What panic = "abort" (the release profile) does: run the default
+        // hook, then abort. Tests build with unwinding, so the harness would
+        // otherwise catch the panic and exit normally.
+        let _ = std::panic::catch_unwind(|| panic!("sandboxed boom"));
+        std::process::abort();
+    };
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_file(&log).unwrap();
+    // The hook prints the message, then abort() raises SIGABRT: neither
+    // step may be killed by the filter first.
+    assert!(
+        text.contains("panicked at") && text.contains("sandboxed boom"),
+        "{text}"
+    );
+    assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
 }
 
 #[test]
@@ -106,15 +201,34 @@ fn seccomp_kills_new_ip_sockets() {
 }
 
 #[test]
-fn seccomp_kills_new_processes() {
-    let Some(status) = in_child("seccomp_kills_new_processes") else {
+fn seccomp_kills_fork() {
+    let Some(status) = in_child("seccomp_kills_fork") else {
         seccomp();
-        let _ = Command::new("/bin/true").status();
+        // SAFETY: the call is expected to kill the process; if it returned,
+        // the child would exit at once without touching shared state.
+        unsafe { libc::fork() };
         sys::exit_now(0);
     };
     assert_killed(status);
 }
 
+#[test]
+fn seccomp_kills_execve() {
+    let Some(status) = in_child("seccomp_kills_execve") else {
+        // A path that does not exist: if execve were allowed it would just
+        // fail with ENOENT and the child would exit normally. A real program
+        // would die under the inherited filter instead, for the wrong reason.
+        let path = c"/nonexistent/mdns-alias-test";
+        let argv = [path.as_ptr(), std::ptr::null()];
+        let envp = [std::ptr::null()];
+        seccomp();
+        // SAFETY: valid NUL-terminated path, argv and envp arrays; the call
+        // is expected to kill the process.
+        unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        sys::exit_now(0);
+    };
+    assert_killed(status);
+}
 #[test]
 fn seccomp_kills_executable_memory() {
     let Some(status) = in_child("seccomp_kills_executable_memory") else {
@@ -169,6 +283,8 @@ fn landlock_denies_files_and_tcp() {
     };
     match status.code() {
         Some(0) => {}
+        // CI runners have Landlock; skipping there would hide a regression.
+        Some(77) if std::env::var_os("CI").is_some() => panic!("Landlock unavailable in CI"),
         Some(77) => eprintln!("Landlock is not available on this kernel; skipped"),
         _ => panic!("{status:?}"),
     }
@@ -207,12 +323,17 @@ fn logging_to_a_file_survives_the_full_lockdown() {
 fn without_proc_only_the_address_space_limit_is_lost() {
     let Some(status) = in_child("without_proc_only_the_address_space_limit_is_lost") else {
         let report = sandbox::lock_with(2, Err(std::io::ErrorKind::NotFound.into()));
-        let rlimits = report.applied.iter().any(|a| a == "rlimits");
-        let missing = report
-            .missing
-            .iter()
-            .any(|m| m.starts_with("address-space limit unavailable"));
-        sys::exit_now(if rlimits && missing { 0 } else { 4 });
+        let applied = |layer: &str| report.applied.iter().any(|a| a == layer);
+        let others = ["rlimits", "non-dumpable", "no-new-privs", "seccomp"];
+        let lost = |prefix: &str| report.missing.iter().any(|m| m.starts_with(prefix));
+        let only = report.missing.iter().all(|m| {
+            m.starts_with("address-space limit unavailable")
+                || m.starts_with("landlock unavailable")
+        });
+        let ok = others.iter().all(|layer| applied(layer))
+            && lost("address-space limit unavailable")
+            && only;
+        sys::exit_now(if ok { 0 } else { 4 });
     };
     assert!(status.success(), "{status:?}");
 }

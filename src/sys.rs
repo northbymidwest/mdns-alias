@@ -13,6 +13,24 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 const ONE: libc::c_ulong = 1;
 const ZERO: libc::c_ulong = 0;
 
+/// musl's syscall() reads six `long` arguments whatever the call; passing
+/// fewer, or narrower ones, leaves the rest unspecified. Every raw syscall
+/// goes through here with all six.
+///
+/// # Safety
+///
+/// The arguments must be valid for syscall `nr`, as for libc::syscall.
+unsafe fn raw_syscall(nr: libc::c_long, args: [libc::c_long; 6]) -> libc::c_long {
+    let [a, b, c, d, e, f] = args;
+    // SAFETY: the caller vouches for the arguments.
+    unsafe { libc::syscall(nr, a, b, c, d, e, f) }
+}
+
+/// A pointer as a syscall argument word.
+fn word<T>(p: *const T) -> libc::c_long {
+    p.expose_provenance() as libc::c_long
+}
+
 fn check(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -102,6 +120,13 @@ pub fn set_not_dumpable() -> io::Result<()> {
     check(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, ZERO, ZERO, ZERO, ZERO) }).map(drop)
 }
 
+/// This thread's kernel id: abort() raises SIGABRT at it, so the seccomp
+/// filter allows tkill for this id alone.
+pub fn thread_id() -> u64 {
+    // SAFETY: gettid ignores its arguments and cannot fail.
+    unsafe { raw_syscall(libc::SYS_gettid, [0; 6]) as u64 }
+}
+
 pub fn page_size() -> u64 {
     // SAFETY: sysconf takes an integer and touches no memory.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
@@ -131,7 +156,9 @@ pub fn install_seccomp(program: &[crate::sandbox::Insn]) -> io::Result<()> {
         libc::prctl(
             libc::PR_SET_SECCOMP,
             libc::c_ulong::from(libc::SECCOMP_MODE_FILTER),
-            &raw const prog,
+            word(&raw const prog) as libc::c_ulong,
+            ZERO,
+            ZERO,
         )
     })
     .map(drop)
@@ -145,17 +172,15 @@ struct LandlockAttr {
     scoped: u64,
 }
 
-const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+const LANDLOCK_CREATE_RULESET_VERSION: libc::c_long = 1;
 
 /// The kernel's Landlock ABI version; an error if Landlock is unavailable.
 pub fn landlock_abi() -> io::Result<u32> {
     // SAFETY: the version query passes no attribute pointer.
     let abi = unsafe {
-        libc::syscall(
+        raw_syscall(
             libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<LandlockAttr>(),
-            0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
+            [0, 0, LANDLOCK_CREATE_RULESET_VERSION, 0, 0, 0],
         )
     };
     if abi < 0 {
@@ -177,17 +202,17 @@ pub fn landlock_restrict(ruleset: &crate::sandbox::Landlock) -> io::Result<()> {
     // SAFETY: attr is live and at least `size` bytes; the new descriptor is
     // owned by `fd` and closed when it drops.
     unsafe {
-        let fd = libc::syscall(
+        let size = ruleset.size as libc::c_long;
+        let fd = raw_syscall(
             libc::SYS_landlock_create_ruleset,
-            &raw const attr,
-            ruleset.size,
-            0u32,
+            [word(&raw const attr), size, 0, 0, 0, 0],
         );
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         let fd = OwnedFd::from_raw_fd(fd as libc::c_int);
-        if libc::syscall(libc::SYS_landlock_restrict_self, fd.as_raw_fd(), 0u32) < 0 {
+        let fd_word = libc::c_long::from(fd.as_raw_fd());
+        if raw_syscall(libc::SYS_landlock_restrict_self, [fd_word, 0, 0, 0, 0, 0]) < 0 {
             return Err(io::Error::last_os_error());
         }
     }

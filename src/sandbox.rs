@@ -1,6 +1,6 @@
-//! The lockdown applied after startup. Building the seccomp program (and,
-//! from Task 5, the Landlock ruleset) is pure and tested everywhere;
-//! applying it goes through `sys` and is Linux only.
+//! The lockdown applied after startup. Building the seccomp program and the
+//! Landlock ruleset is pure and tested everywhere; applying them goes
+//! through `sys` and is Linux only.
 
 #[cfg(target_os = "linux")]
 use std::io;
@@ -14,16 +14,108 @@ pub struct Insn {
     pub k: u32,
 }
 
+/// The value an argument must have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Value {
+    /// Exactly this 64-bit value.
+    Is(u64),
+    /// The locking thread's id, known only at run time: compiled as a
+    /// placeholder in one instruction, `Program::tid_slot`, patched at
+    /// lockdown.
+    ThreadId,
+}
+
 /// One allowlist entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Rule {
     /// The syscall, with any arguments.
     Any(i64),
     /// The syscall, if its arguments match one of the alternatives, each a
-    /// list of (argument index, exact 64-bit value).
-    Args(i64, Vec<Vec<(u8, u64)>>),
+    /// list of (argument index, value).
+    Args(i64, &'static [&'static [(u8, Value)]]),
     /// The syscall, if argument `.1` has none of the bits in `.2` set.
     Clear(i64, u8, u64),
+}
+
+/// A compiled filter in a buffer of `N` instructions, of which the first
+/// `len` are used.
+#[derive(Clone, Copy, Debug)]
+pub struct Program<const N: usize> {
+    pub insns: [Insn; N],
+    pub len: usize,
+    /// The instruction comparing against `Value::ThreadId`, if any.
+    pub tid_slot: Option<usize>,
+}
+
+impl<const N: usize> Program<N> {
+    const fn push(&mut self, insn: Insn) {
+        if self.len == N {
+            panic!("seccomp filter longer than its buffer");
+        }
+        self.insns[self.len] = insn;
+        self.len += 1;
+    }
+
+    /// Allow if any alternative matches every one of its (argument, value)
+    /// pairs, comparing both 32-bit halves; otherwise kill.
+    const fn args(&mut self, alternatives: &[&[(u8, Value)]]) {
+        let mut a = 0;
+        while a < alternatives.len() {
+            let alternative = alternatives[a];
+            // A mismatch skips to just past this alternative's return.
+            let end = self.len + 4 * alternative.len() + 1;
+            let mut c = 0;
+            while c < alternative.len() {
+                let (arg, value) = alternative[c];
+                let (low, high) = match value {
+                    Value::Is(v) => (v as u32, (v >> 32) as u32),
+                    Value::ThreadId => {
+                        if self.tid_slot.is_some() {
+                            panic!("more than one thread-id argument");
+                        }
+                        // The JEQ after this load; patched at lockdown.
+                        self.tid_slot = Some(self.len + 1);
+                        (0, 0)
+                    }
+                };
+                self.push(ins(LD_W_ABS, 0, 0, arg_offset(arg, false)));
+                self.push(ins(JEQ_K, 0, jump(end - self.len - 1), low));
+                self.push(ins(LD_W_ABS, 0, 0, arg_offset(arg, true)));
+                self.push(ins(JEQ_K, 0, jump(end - self.len - 1), high));
+                c += 1;
+            }
+            self.push(ret(RET_ALLOW));
+            a += 1;
+        }
+        self.push(ret(RET_KILL_PROCESS));
+    }
+
+    /// Allow unless argument `arg` has any bit of `mask` set.
+    const fn clear(&mut self, arg: u8, mask: u64) {
+        self.push(ins(LD_W_ABS, 0, 0, arg_offset(arg, false)));
+        self.push(ins(JSET_K, 3, 0, mask as u32));
+        self.push(ins(LD_W_ABS, 0, 0, arg_offset(arg, true)));
+        self.push(ins(JSET_K, 1, 0, (mask >> 32) as u32));
+        self.push(ret(RET_ALLOW));
+        self.push(ret(RET_KILL_PROCESS));
+    }
+}
+
+/// How many instructions a rule's body takes; every body ends in a return.
+const fn body_len(rule: &Rule) -> usize {
+    match *rule {
+        Rule::Any(_) => 1,
+        Rule::Args(_, alternatives) => {
+            let mut len = 1;
+            let mut a = 0;
+            while a < alternatives.len() {
+                len += 4 * alternatives[a].len() + 1;
+                a += 1;
+            }
+            len
+        }
+        Rule::Clear(..) => 6,
+    }
 }
 
 const LD_W_ABS: u16 = 0x20;
@@ -43,166 +135,203 @@ const X32_BIT: u32 = 0x4000_0000;
 #[cfg(target_endian = "big")]
 compile_error!("seccomp argument offsets below assume a little-endian target");
 
-fn ins(code: u16, jt: u8, jf: u8, k: u32) -> Insn {
+const fn ins(code: u16, jt: u8, jf: u8, k: u32) -> Insn {
     Insn { code, jt, jf, k }
 }
 
-fn ret(k: u32) -> Insn {
+const fn ret(k: u32) -> Insn {
     ins(RET_K, 0, 0, k)
 }
 
 /// Where the low or high 32 bits of argument `arg` sit in seccomp_data.
-fn arg_offset(arg: u8, high: bool) -> u32 {
-    16 + 8 * u32::from(arg) + if high { 4 } else { 0 }
+const fn arg_offset(arg: u8, high: bool) -> u32 {
+    16 + 8 * arg as u32 + if high { 4 } else { 0 }
 }
 
 /// A BPF jump distance. The allowlist is small and fixed, so every jump
-/// fits; a rule body that ever outgrows one fails loudly here.
-fn jump(n: usize) -> u8 {
-    u8::try_from(n).expect("seccomp rule body longer than a BPF jump")
+/// fits; a rule body that ever outgrows one fails the build here.
+const fn jump(n: usize) -> u8 {
+    if n > u8::MAX as usize {
+        panic!("seccomp rule body longer than a BPF jump");
+    }
+    n as u8
 }
 
 /// Compiles `rules` into a filter for `arch` (an AUDIT_ARCH value): any other
 /// architecture is killed, so is every syscall no rule allows, and with
-/// `x32_guard`, every x32-ABI number.
-pub fn compile(arch: u32, x32_guard: bool, rules: &[Rule]) -> Vec<Insn> {
-    let mut filter = vec![
-        ins(LD_W_ABS, 0, 0, OFFSET_ARCH),
-        ins(JEQ_K, 1, 0, arch),
-        ret(RET_KILL_PROCESS),
-        ins(LD_W_ABS, 0, 0, OFFSET_NR),
-    ];
+/// `x32_guard`, every x32-ABI number. A `const fn`, so the real allowlist is
+/// compiled at build time, and a rule that cannot compile fails the build.
+pub const fn compile<const N: usize>(arch: u32, x32_guard: bool, rules: &[Rule]) -> Program<N> {
+    let mut program = Program {
+        insns: [ret(RET_KILL_PROCESS); N],
+        len: 0,
+        tid_slot: None,
+    };
+    program.push(ins(LD_W_ABS, 0, 0, OFFSET_ARCH));
+    program.push(ins(JEQ_K, 1, 0, arch));
+    program.push(ret(RET_KILL_PROCESS));
+    program.push(ins(LD_W_ABS, 0, 0, OFFSET_NR));
     if x32_guard {
-        filter.push(ins(JGE_K, 0, 1, X32_BIT));
-        filter.push(ret(RET_KILL_PROCESS));
+        program.push(ins(JGE_K, 0, 1, X32_BIT));
+        program.push(ret(RET_KILL_PROCESS));
     }
-    for rule in rules {
-        let (nr, body) = match rule {
-            Rule::Any(nr) => (*nr, vec![ret(RET_ALLOW)]),
-            Rule::Args(nr, alternatives) => (*nr, args_body(alternatives)),
-            Rule::Clear(nr, arg, mask) => (*nr, clear_body(*arg, *mask)),
+    let mut r = 0;
+    while r < rules.len() {
+        let rule = &rules[r];
+        let nr = match *rule {
+            Rule::Any(nr) | Rule::Args(nr, _) | Rule::Clear(nr, ..) => nr,
         };
         // Every body ends in a return, so skipping it lands on the next
         // rule's test with the syscall number still loaded.
-        filter.push(ins(JEQ_K, 0, jump(body.len()), nr as u32));
-        filter.extend(body);
+        program.push(ins(JEQ_K, 0, jump(body_len(rule)), nr as u32));
+        match *rule {
+            Rule::Any(_) => program.push(ret(RET_ALLOW)),
+            Rule::Args(_, alternatives) => program.args(alternatives),
+            Rule::Clear(_, arg, mask) => program.clear(arg, mask),
+        }
+        r += 1;
     }
-    filter.push(ret(RET_KILL_PROCESS));
-    filter
+    program.push(ret(RET_KILL_PROCESS));
+    program
 }
 
-/// Allow if any alternative matches every one of its (argument, value)
-/// pairs, comparing both 32-bit halves; otherwise kill.
-fn args_body(alternatives: &[Vec<(u8, u64)>]) -> Vec<Insn> {
-    let mut body = Vec::new();
-    for alternative in alternatives {
-        let mut block = Vec::new();
-        for &(arg, value) in alternative {
-            for (high, half) in [(false, value as u32), (true, (value >> 32) as u32)] {
-                block.push(ins(LD_W_ABS, 0, 0, arg_offset(arg, high)));
-                block.push(ins(JEQ_K, 0, 0, half));
-            }
-        }
-        block.push(ret(RET_ALLOW));
-        // A mismatch skips to just past this alternative's return.
-        let len = block.len();
-        for (i, insn) in block.iter_mut().enumerate() {
-            if insn.code == JEQ_K {
-                insn.jf = jump(len - i - 1);
-            }
-        }
-        body.extend(block);
+/// The used part of `program`, as an exact-size array.
+#[cfg(target_os = "linux")]
+const fn truncate<const N: usize, const M: usize>(program: &Program<N>) -> [Insn; M] {
+    if program.len != M {
+        panic!("truncated to the wrong length");
     }
-    body.push(ret(RET_KILL_PROCESS));
-    body
-}
-
-/// Allow unless argument `arg` has any bit of `mask` set.
-fn clear_body(arg: u8, mask: u64) -> Vec<Insn> {
-    vec![
-        ins(LD_W_ABS, 0, 0, arg_offset(arg, false)),
-        ins(JSET_K, 3, 0, mask as u32),
-        ins(LD_W_ABS, 0, 0, arg_offset(arg, true)),
-        ins(JSET_K, 1, 0, (mask >> 32) as u32),
-        ret(RET_ALLOW),
-        ret(RET_KILL_PROCESS),
-    ]
+    let mut out = [ret(RET_KILL_PROCESS); M];
+    let mut i = 0;
+    while i < M {
+        out[i] = program.insns[i];
+        i += 1;
+    }
+    out
 }
 
 /// This build's AUDIT_ARCH value, and whether it needs the x32 guard.
-/// `None` on architectures without a filter here.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const ARCH: u32 = 0xC000_003E;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const X32_GUARD: bool = true;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const ARCH: u32 = 0xC000_00B7;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const X32_GUARD: bool = false;
+
+/// Constants are small and positive, so widening keeps their value.
 #[cfg(target_os = "linux")]
-pub fn arch() -> Option<(u32, bool)> {
-    if cfg!(target_arch = "x86_64") {
-        Some((0xC000_003E, true))
-    } else if cfg!(target_arch = "aarch64") {
-        Some((0xC000_00B7, false))
-    } else {
-        None
-    }
+const fn v(x: libc::c_int) -> Value {
+    Value::Is(x as u64)
 }
 
 /// Every syscall the steady state makes, and nothing else. Startup is never
 /// filtered. Changes come from tracing the real binary; each line says why.
 #[cfg(target_os = "linux")]
-pub fn allowlist() -> Vec<Rule> {
-    // Constants are small and positive, so widening keeps their value.
-    fn v(x: libc::c_int) -> u64 {
-        x as u64
-    }
-    let sockopts = [
-        (libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP),
-        (libc::IPPROTO_IP, libc::IP_DROP_MEMBERSHIP),
-        (libc::IPPROTO_IP, libc::IP_MULTICAST_IF),
-        (libc::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP),
-        (libc::IPPROTO_IPV6, libc::IPV6_DROP_MEMBERSHIP),
-        (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF),
-    ];
-    vec![
-        // Receiving: mDNS (recvmsg), netlink replies (recvfrom), the
-        // signalfd (read).
-        Rule::Any(libc::SYS_recvmsg),
-        Rule::Any(libc::SYS_recvfrom),
-        Rule::Any(libc::SYS_read),
-        // Sending: replies, announcements, netlink requests.
-        Rule::Any(libc::SYS_sendto),
-        // Choosing the send interface; joining and leaving groups on rescans.
-        Rule::Args(
-            libc::SYS_setsockopt,
-            sockopts
-                .iter()
-                .map(|&(level, opt)| vec![(1, v(level)), (2, v(opt))])
-                .collect(),
-        ),
-        // The rescan's netlink socket, and no other.
-        Rule::Args(
-            libc::SYS_socket,
-            vec![vec![(0, v(libc::AF_NETLINK)), (2, v(libc::NETLINK_ROUTE))]],
-        ),
-        Rule::Any(libc::SYS_close),
-        // Only reading the close-on-exec flag: debug builds of std check
-        // that a descriptor is open (F_GETFD) before closing it.
-        Rule::Args(libc::SYS_fcntl, vec![vec![(1, v(libc::F_GETFD))]]),
-        // Logging, to stderr only.
-        Rule::Args(libc::SYS_write, vec![vec![(0, 2)]]),
-        Rule::Args(libc::SYS_writev, vec![vec![(0, 2)]]),
-        // Memory, never executable.
-        Rule::Clear(libc::SYS_mmap, 2, v(libc::PROT_EXEC)),
-        Rule::Clear(libc::SYS_mprotect, 2, v(libc::PROT_EXEC)),
-        Rule::Any(libc::SYS_munmap),
-        Rule::Any(libc::SYS_mremap),
-        Rule::Any(libc::SYS_madvise),
-        Rule::Any(libc::SYS_brk),
-        // Time (normally the vDSO, but libc may fall back) and locks.
-        Rule::Any(libc::SYS_clock_gettime),
-        Rule::Any(libc::SYS_futex),
-        // Leaving. Returning from main runs std's cleanup, which takes down
-        // the stack-overflow guard's alternate signal stack.
-        Rule::Any(libc::SYS_sigaltstack),
-        Rule::Any(libc::SYS_exit),
-        Rule::Any(libc::SYS_exit_group),
-        Rule::Any(libc::SYS_rt_sigreturn),
-    ]
+pub const ALLOWLIST: &[Rule] = &[
+    // Receiving: mDNS (recvmsg), netlink replies (recvfrom), the signalfd
+    // (read).
+    Rule::Any(libc::SYS_recvmsg),
+    Rule::Any(libc::SYS_recvfrom),
+    Rule::Any(libc::SYS_read),
+    // Sending: replies, announcements, netlink requests.
+    Rule::Any(libc::SYS_sendto),
+    // Choosing the send interface; joining and leaving groups on rescans.
+    Rule::Args(
+        libc::SYS_setsockopt,
+        &[
+            &[(1, v(libc::IPPROTO_IP)), (2, v(libc::IP_ADD_MEMBERSHIP))],
+            &[(1, v(libc::IPPROTO_IP)), (2, v(libc::IP_DROP_MEMBERSHIP))],
+            &[(1, v(libc::IPPROTO_IP)), (2, v(libc::IP_MULTICAST_IF))],
+            &[
+                (1, v(libc::IPPROTO_IPV6)),
+                (2, v(libc::IPV6_ADD_MEMBERSHIP)),
+            ],
+            &[
+                (1, v(libc::IPPROTO_IPV6)),
+                (2, v(libc::IPV6_DROP_MEMBERSHIP)),
+            ],
+            &[(1, v(libc::IPPROTO_IPV6)), (2, v(libc::IPV6_MULTICAST_IF))],
+        ],
+    ),
+    // The rescan's netlink socket, and no other.
+    Rule::Args(
+        libc::SYS_socket,
+        &[&[(0, v(libc::AF_NETLINK)), (2, v(libc::NETLINK_ROUTE))]],
+    ),
+    Rule::Any(libc::SYS_close),
+    // Only reading the close-on-exec flag: debug builds of std check that a
+    // descriptor is open (F_GETFD) before closing it.
+    Rule::Args(libc::SYS_fcntl, &[&[(1, v(libc::F_GETFD))]]),
+    // Logging, to stderr only.
+    Rule::Args(libc::SYS_write, &[&[(0, Value::Is(2))]]),
+    Rule::Args(libc::SYS_writev, &[&[(0, Value::Is(2))]]),
+    // Memory, never executable.
+    Rule::Clear(libc::SYS_mmap, 2, libc::PROT_EXEC as u64),
+    Rule::Clear(libc::SYS_mprotect, 2, libc::PROT_EXEC as u64),
+    Rule::Any(libc::SYS_munmap),
+    Rule::Any(libc::SYS_mremap),
+    Rule::Any(libc::SYS_madvise),
+    Rule::Any(libc::SYS_brk),
+    // Time (normally the vDSO, but libc may fall back) and locks.
+    Rule::Any(libc::SYS_clock_gettime),
+    Rule::Any(libc::SYS_futex),
+    // A panic reporting itself and aborting: the hook asks for the thread
+    // id, then abort() blocks signals and raises SIGABRT at this thread only.
+    Rule::Any(libc::SYS_gettid),
+    Rule::Any(libc::SYS_rt_sigprocmask),
+    Rule::Args(
+        libc::SYS_tkill,
+        &[&[(0, Value::ThreadId), (1, v(libc::SIGABRT))]],
+    ),
+    // Leaving. Returning from main runs std's cleanup, which takes down the
+    // stack-overflow guard's alternate signal stack.
+    Rule::Any(libc::SYS_sigaltstack),
+    Rule::Any(libc::SYS_exit),
+    Rule::Any(libc::SYS_exit_group),
+    Rule::Any(libc::SYS_rt_sigreturn),
+];
+
+/// The allowlist compiled at build time into a scratch buffer, which never
+/// reaches the binary: only `FILTER`, cut to size from it, does.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const COMPILED: Program<256> = compile(ARCH, X32_GUARD, ALLOWLIST);
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub const FILTER_LEN: usize = COMPILED.len;
+/// The seccomp filter, built at compile time, in read-only data.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub static FILTER: [Insn; FILTER_LEN] = truncate(&COMPILED);
+/// The one instruction in `FILTER` to patch with the locking thread's id.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub const TID_SLOT: usize = match COMPILED.tid_slot {
+    Some(slot) => slot,
+    None => panic!("the allowlist has no thread-id argument"),
+};
+
+/// `FILTER`, with the thread `tid` as the only one abort() may signal.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn program(tid: u64) -> Vec<Insn> {
+    let mut program = FILTER.to_vec();
+    // Thread ids fit 32 bits (the kernel caps them far lower), so the high
+    // half's comparison stays 0.
+    program[TID_SLOT].k = tid as u32;
+    program
 }
 
 /// The highest Landlock ABI whose rights this table knows. Newer kernels get
@@ -344,13 +473,13 @@ pub fn lock_with(highest_fd: i32, statm: io::Result<String>) -> Report {
         Ok(format!("landlock ABI {abi}"))
     });
     report.note("landlock", landlock);
-    let seccomp = match arch() {
-        Some((arch, x32)) => sys::install_seccomp(&compile(arch, x32, &allowlist())),
-        None => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no filter for this architecture",
-        )),
-    };
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let seccomp = sys::install_seccomp(&program(sys::thread_id()));
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let seccomp: io::Result<()> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no filter for this architecture",
+    ));
     report.note("seccomp", seccomp.map(|()| "seccomp".into()));
     report
 }
@@ -397,17 +526,27 @@ mod tests {
         }
     }
 
-    fn rules() -> Vec<Rule> {
-        vec![
-            Rule::Any(1),
-            Rule::Args(41, vec![vec![(0, 16), (2, 0)]]),
-            Rule::Args(54, vec![vec![(1, 0), (2, 35)], vec![(1, 41), (2, 20)]]),
-            Rule::Clear(9, 2, 4),
-        ]
+    const RULES: &[Rule] = &[
+        Rule::Any(1),
+        Rule::Args(41, &[&[(0, Value::Is(16)), (2, Value::Is(0))]]),
+        Rule::Args(
+            54,
+            &[
+                &[(1, Value::Is(0)), (2, Value::Is(35))],
+                &[(1, Value::Is(41)), (2, Value::Is(20))],
+            ],
+        ),
+        Rule::Clear(9, 2, 4),
+    ];
+
+    /// The used part of a filter compiled at run time, as tests need it.
+    fn compiled(arch: u32, x32_guard: bool, rules: &[Rule]) -> Vec<Insn> {
+        let program = compile::<256>(arch, x32_guard, rules);
+        program.insns[..program.len].to_vec()
     }
 
     fn filter() -> Vec<Insn> {
-        compile(X86_64, true, &rules())
+        compiled(X86_64, true, RULES)
     }
 
     #[test]
@@ -429,12 +568,17 @@ mod tests {
     fn x32_guard_kills_x32_numbers_even_if_listed() {
         let listed = [Rule::Any(0x4000_0001)];
         assert_eq!(
-            run(&compile(X86_64, true, &listed), X86_64, 0x4000_0001, [0; 6]),
+            run(
+                &compiled(X86_64, true, &listed),
+                X86_64,
+                0x4000_0001,
+                [0; 6]
+            ),
             RET_KILL_PROCESS
         );
         assert_eq!(
             run(
-                &compile(X86_64, false, &listed),
+                &compiled(X86_64, false, &listed),
                 X86_64,
                 0x4000_0001,
                 [0; 6]
@@ -493,10 +637,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_allowlist_allows_the_steady_state_and_nothing_else() {
-        let (arch, x32) = arch().expect("tests run on x86_64 or aarch64");
-        let f = compile(arch, x32, &allowlist());
-        let call = |nr: i64, args: [u64; 6]| run(&f, arch, nr as u32, args);
+    fn linux_allowlist_allows_the_steady_state_and_kills_samples_of_the_rest() {
+        let tid = 4242;
+        let f = program(tid);
+        let call = |nr: i64, args: [u64; 6]| run(&f, ARCH, nr as u32, args);
         let netlink = [
             libc::AF_NETLINK as u64,
             3,
@@ -525,6 +669,31 @@ mod tests {
         );
         assert_eq!(call(libc::SYS_sigaltstack, [0; 6]), RET_ALLOW);
         assert_eq!(call(libc::SYS_openat, [0; 6]), RET_KILL_PROCESS);
+        // A panic may report and abort itself, at this thread only.
+        let abrt = libc::SIGABRT as u64;
+        assert_eq!(call(libc::SYS_gettid, [0; 6]), RET_ALLOW);
+        assert_eq!(call(libc::SYS_tkill, [tid, abrt, 0, 0, 0, 0]), RET_ALLOW);
+        assert_eq!(
+            call(libc::SYS_tkill, [tid + 1, abrt, 0, 0, 0, 0]),
+            RET_KILL_PROCESS
+        );
+        assert_eq!(
+            call(libc::SYS_tkill, [tid, libc::SIGKILL as u64, 0, 0, 0, 0]),
+            RET_KILL_PROCESS
+        );
+        // No new processes or threads, and no signals to anything else.
+        for nr in [
+            libc::SYS_clone,
+            libc::SYS_clone3,
+            libc::SYS_kill,
+            libc::SYS_tgkill,
+        ] {
+            assert_eq!(call(nr, [0; 6]), RET_KILL_PROCESS, "syscall {nr}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        for nr in [libc::SYS_fork, libc::SYS_vfork, libc::SYS_open] {
+            assert_eq!(call(nr, [0; 6]), RET_KILL_PROCESS, "syscall {nr}");
+        }
         assert_eq!(call(libc::SYS_execve, [0; 6]), RET_KILL_PROCESS);
     }
 
@@ -601,5 +770,75 @@ mod tests {
         );
         assert_eq!(address_space_limit("garbage", 4096), None);
         assert_eq!(address_space_limit("", 4096), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_allowlist_jumps_land_inside_the_filter() {
+        let f = program(4242);
+        for (pc, insn) in f.iter().enumerate() {
+            if matches!(insn.code, JEQ_K | JGE_K | JSET_K) {
+                assert!(
+                    pc + 1 + usize::from(insn.jt.max(insn.jf)) < f.len(),
+                    "jump at {pc}"
+                );
+            }
+        }
+        assert_eq!(
+            f.last().map(|i| (i.code, i.k)),
+            Some((RET_K, RET_KILL_PROCESS))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "longer than its buffer")]
+    fn a_filter_that_does_not_fit_its_buffer_panics() {
+        compile::<8>(X86_64, true, RULES);
+    }
+
+    #[test]
+    #[should_panic(expected = "longer than a BPF jump")]
+    fn a_rule_body_past_a_bpf_jump_panics() {
+        const MANY: &[(u8, Value)] = &[(0, Value::Is(1)); 64];
+        compile::<512>(X86_64, true, &[Rule::Args(1, &[MANY])]);
+    }
+
+    #[test]
+    fn a_thread_id_argument_is_one_patchable_slot() {
+        let rules = [Rule::Args(
+            200,
+            &[&[(0, Value::ThreadId), (1, Value::Is(6))]],
+        )];
+        let program = compile::<64>(X86_64, true, &rules);
+        let slot = program.tid_slot.expect("one thread-id slot");
+        assert_eq!(
+            (program.insns[slot].code, program.insns[slot].k),
+            (JEQ_K, 0)
+        );
+        let mut f = program.insns[..program.len].to_vec();
+        f[slot].k = 77;
+        assert_eq!(run(&f, X86_64, 200, [77, 6, 0, 0, 0, 0]), RET_ALLOW);
+        assert_eq!(run(&f, X86_64, 200, [78, 6, 0, 0, 0, 0]), RET_KILL_PROCESS);
+        assert_eq!(
+            run(&f, X86_64, 200, [77 | 1 << 32, 6, 0, 0, 0, 0]),
+            RET_KILL_PROCESS
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_static_filter_is_exact_and_differs_only_in_the_thread_id() {
+        assert_eq!(FILTER.len(), FILTER_LEN);
+        assert_eq!(
+            FILTER.last().map(|i| (i.code, i.k)),
+            Some((RET_K, RET_KILL_PROCESS))
+        );
+        let patched = program(4242);
+        assert_eq!(patched.len(), FILTER.len());
+        let differ: Vec<usize> = (0..FILTER.len())
+            .filter(|&i| patched[i] != FILTER[i])
+            .collect();
+        assert_eq!(differ, [TID_SLOT]);
+        assert_eq!(patched[TID_SLOT].k, 4242);
     }
 }

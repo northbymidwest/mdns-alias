@@ -18,12 +18,16 @@ section is missing or empty, or to leave anything behind under `Unreleased`.
   else. Layers the kernel lacks are logged and skipped; `--require-sandbox`
   makes them fatal.
 - mdns-alias refuses to run as root.
+- A panic under the sandbox still prints its message and ends in SIGABRT,
+  rather than a bare SIGSYS that would look like a sandbox violation.
 
 ### Changed
 
 - Packets from senders that are not on-link for the arrival interface are
   ignored (RFC 6762 section 11), so off-link hosts can no longer trigger
-  replies or the conflict exit.
+  replies or the conflict exit. Link-local senders (169.254/16, fe80::/10)
+  are always on-link. The first off-link sender on an interface is logged
+  once per rescan, so a netmask that does not cover the LAN is visible.
 - Interfaces without multicast support are skipped.
 - On Linux, signals are read from a signalfd and interfaces are listed over
   netlink, dropping `ctrlc` and `if-addrs` from the image and its second

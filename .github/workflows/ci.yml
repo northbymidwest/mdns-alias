@@ -66,9 +66,14 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --target "$TARGET"
       - run: cargo build --release --target "$TARGET"
+      # `lint` runs clippy on Linux only, which never compiles the
+      # development-platform code (ctrlc signals, if-addrs interfaces).
+      - if: runner.os == 'macOS'
+        run: cargo clippy --all-targets --target "$TARGET" -- -D warnings
 
   # `test` above already runs the newest stable. This job is the release that
   # has not happened yet: a regression caught here is six weeks from reaching

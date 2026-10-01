@@ -73,7 +73,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             next_rescan = now() + RESCAN_INTERVAL;
         }
         for family in [Family::V4, Family::V6] {
-            match net.recv(family, &mut buf) {
+            let received = net.recv(family, &mut buf);
+            for line in net.take_log() {
+                eprintln!("mdns-alias: {line}");
+            }
+            match received {
                 Ok(Some(got)) => {
                     // A conflict ends the program: the name is someone else's.
                     let step = responder.handle(&buf[..got.len], got.link, got.source, now())?;
