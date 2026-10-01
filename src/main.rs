@@ -1,7 +1,7 @@
 //! Publish extra mDNS host names for this machine, as CNAMEs of its own
 //! `.local` name.
 //!
-//! Usage: `mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <alias.local>...`
+//! Usage: `mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <name>...`
 
 #![forbid(unsafe_code)]
 
@@ -41,10 +41,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("refusing to run as root; run as an unprivileged user".into());
     }
     let hostname = std::fs::read_to_string(HOSTNAME_FILE).ok();
-    let target = cli::target(&cli, hostname.as_deref())?;
+    let (target, aliases) = cli::resolve(&cli, hostname.as_deref())?;
     // Only for probe jitter, so a hash of the pid with a random key is plenty.
     let seed = RandomState::new().hash_one(std::process::id());
-    let mut responder = Responder::new(cli.aliases.clone(), target.clone(), seed)?;
+    let mut responder = Responder::new(aliases.clone(), target.clone(), seed)?;
     let signals = Signals::new()?;
     let (mut net, log) = Net::open(cli.interfaces)?;
     for line in log {
@@ -59,7 +59,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if cli.require_sandbox && !report.complete() {
         return Err("--require-sandbox: not every sandbox layer could be applied".into());
     }
-    for alias in &cli.aliases {
+    for alias in &aliases {
         eprintln!("mdns-alias: publishing {alias} -> {target}");
     }
 

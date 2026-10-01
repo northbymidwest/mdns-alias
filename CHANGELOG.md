@@ -8,6 +8,17 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Changed
+
+- Breaking: a name that does not end in `.local` is now relative to the
+  target instead of an error: `mdns-alias seerr sonarr` publishes
+  `seerr.<host>.local` and `sonarr.<host>.local`. Multi-label names work the
+  same way (`api.seerr`), names ending in `.local` are used as given, and a
+  trailing dot marks a name as absolute. The full names are logged at
+  startup. Command lines that worked before mean the same thing.
+
 ## 0.3.1 - 2026-09-30
 
 ### Changed

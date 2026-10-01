@@ -7,12 +7,18 @@ machine their own `.local` names, such as `app.myhost.local`, that follow the
 machine's address wherever DHCP puts it.
 
 ```sh
-mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <alias.local>...
-mdns-alias app.myhost.local media.myhost.local
+mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <name>...
+mdns-alias app media           # app.myhost.local, media.myhost.local
+mdns-alias api.app tv.local    # api.app.myhost.local, tv.local
 ```
 
-The target defaults to this host's name plus `.local` (read from
-`/proc/sys/kernel/hostname`, so elsewhere than Linux `--target` is required).
+Every alias is a CNAME of the target, which defaults to this host's name plus
+`.local` (read from `/proc/sys/kernel/hostname`, so elsewhere than Linux
+`--target` is required). A name ending in `.local` is used as given; any
+other name is relative to the target, as in a DNS zone file, so `app` means
+`app.myhost.local`. A trailing dot marks a name as absolute. The full names
+are logged at startup.
+
 It answers on every interface that is up, except loopback, point-to-point and
 container interfaces (`docker*`, `br-*`, `veth*`); `--interface`, repeatable,
 names the interfaces to use instead. Interfaces are rescanned every 30
@@ -47,7 +53,7 @@ services:
   mdns-alias:
     image: ghcr.io/northbymidwest/mdns-alias:0.3.1
     network_mode: host
-    command: ["app.myhost.local"]
+    command: ["app", "media"]
     read_only: true
     cap_drop: [ALL]
     restart: unless-stopped

@@ -87,6 +87,12 @@ impl Name {
                 .is_some_and(|l| l.eq_ignore_ascii_case(b"local"))
     }
 
+    /// This name with `base` appended: `seerr` under `myhost.local` is
+    /// `seerr.myhost.local`. Fails if the result is too long.
+    pub fn under(&self, base: &Name) -> Result<Name, NameError> {
+        Name::from_labels(self.0.iter().chain(&base.0).cloned().collect())
+    }
+
     /// Uncompressed wire form, which record comparison (RFC 6762 section
     /// 8.2) is defined on.
     pub fn to_wire(&self) -> Vec<u8> {
@@ -617,5 +623,15 @@ mod tests {
         // as a pointer (2). Second: "b" and a pointer (4), fixed (10),
         // pointer (2).
         assert_eq!(encode(&msg).len(), 12 + 28 + 16);
+    }
+
+    #[test]
+    fn under_appends_the_base_and_checks_length() {
+        assert_eq!(
+            name("api.seerr").under(&name("myhost.local")),
+            Ok(name("api.seerr.myhost.local"))
+        );
+        let long = name(&vec!["a".repeat(60); 4].join("."));
+        assert_eq!(long.under(&name("myhost.local")), Err(NameError::TooLong));
     }
 }
