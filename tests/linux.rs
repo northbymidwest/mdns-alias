@@ -98,6 +98,14 @@ fn seccomp_allows_the_steady_state() {
         let buffer = vec![1u8; 1 << 20];
         std::hint::black_box(&buffer);
         drop(buffer);
+        // Growing past the allocator's mmap threshold reallocates through
+        // mremap, and freeing returns pages through madvise or munmap.
+        let mut grow: Vec<u8> = Vec::new();
+        while grow.len() < 8 << 20 {
+            grow.extend_from_slice(&[7u8; 64 << 10]);
+        }
+        std::hint::black_box(&grow);
+        drop(grow);
         eprintln!("sandboxed child: rescanned {rescanned}, received {got}");
         sys::exit_now(if rescanned && got == 4 && quiet { 0 } else { 3 });
     };

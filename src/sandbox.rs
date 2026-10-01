@@ -159,9 +159,10 @@ const fn jump(n: usize) -> u8 {
 
 /// Compiles `rules` into a filter for `arch` (an AUDIT_ARCH value): any other
 /// architecture is killed, so is every syscall no rule allows, and with
-/// `x32_guard`, every x32-ABI number. A `const fn`, so the real allowlist is
+/// `x32_guard`, every x32-ABI number. The rules come in `lists`, concatenated.
+/// A `const fn`, so the real allowlist is
 /// compiled at build time, and a rule that cannot compile fails the build.
-pub const fn compile<const N: usize>(arch: u32, x32_guard: bool, rules: &[Rule]) -> Program<N> {
+pub const fn compile<const N: usize>(arch: u32, x32_guard: bool, lists: &[&[Rule]]) -> Program<N> {
     let mut program = Program {
         insns: [ret(RET_KILL_PROCESS); N],
         len: 0,
@@ -175,9 +176,15 @@ pub const fn compile<const N: usize>(arch: u32, x32_guard: bool, rules: &[Rule])
         program.push(ins(JGE_K, 0, 1, X32_BIT));
         program.push(ret(RET_KILL_PROCESS));
     }
+    let mut l = 0;
     let mut r = 0;
-    while r < rules.len() {
-        let rule = &rules[r];
+    while l < lists.len() {
+        if r == lists[l].len() {
+            l += 1;
+            r = 0;
+            continue;
+        }
+        let rule = &lists[l][r];
         let nr = match *rule {
             Rule::Any(nr) | Rule::Args(nr, _) | Rule::Clear(nr, ..) => nr,
         };
@@ -261,22 +268,27 @@ pub const ALLOWLIST: &[Rule] = &[
         &[&[(0, v(libc::AF_NETLINK)), (2, v(libc::NETLINK_ROUTE))]],
     ),
     Rule::Any(libc::SYS_close),
-    // Only reading the close-on-exec flag: debug builds of std check that a
-    // descriptor is open (F_GETFD) before closing it.
-    Rule::Args(libc::SYS_fcntl, &[&[(1, v(libc::F_GETFD))]]),
     // Logging, to stderr only.
     Rule::Args(libc::SYS_write, &[&[(0, Value::Is(2))]]),
-    Rule::Args(libc::SYS_writev, &[&[(0, Value::Is(2))]]),
-    // Memory, never executable.
+    // Memory: musl's allocator maps, unmaps, grows (realloc), frees pages
+    // (madvise) and moves the break. Never executable, never at a fixed
+    // address over another mapping, no other advice. No mprotect at all:
+    // after lockdown nothing changes a mapping's permissions.
     Rule::Clear(libc::SYS_mmap, 2, libc::PROT_EXEC as u64),
-    Rule::Clear(libc::SYS_mprotect, 2, libc::PROT_EXEC as u64),
     Rule::Any(libc::SYS_munmap),
-    Rule::Any(libc::SYS_mremap),
-    Rule::Any(libc::SYS_madvise),
+    Rule::Args(
+        libc::SYS_mremap,
+        &[&[(3, Value::Is(0))], &[(3, v(libc::MREMAP_MAYMOVE))]],
+    ),
+    Rule::Args(
+        libc::SYS_madvise,
+        &[&[(2, v(libc::MADV_FREE))], &[(2, v(libc::MADV_DONTNEED))]],
+    ),
     Rule::Any(libc::SYS_brk),
-    // Time (normally the vDSO, but libc may fall back) and locks.
+    // Time: normally the vDSO, but libc falls back to the syscall when the
+    // clock source cannot be read from user space, as on some VMs. No
+    // futex: the process is single-threaded, so no lock ever waits.
     Rule::Any(libc::SYS_clock_gettime),
-    Rule::Any(libc::SYS_futex),
     // A panic reporting itself and aborting: the hook asks for the thread
     // id, then abort() blocks signals and raises SIGABRT at this thread only.
     Rule::Any(libc::SYS_gettid),
@@ -286,12 +298,20 @@ pub const ALLOWLIST: &[Rule] = &[
         &[&[(0, Value::ThreadId), (1, v(libc::SIGABRT))]],
     ),
     // Leaving. Returning from main runs std's cleanup, which takes down the
-    // stack-overflow guard's alternate signal stack.
+    // stack-overflow guard's alternate signal stack. Only exit_group: there
+    // are no threads to end alone, and no handler ever returns, so no
+    // rt_sigreturn either.
     Rule::Any(libc::SYS_sigaltstack),
-    Rule::Any(libc::SYS_exit),
     Rule::Any(libc::SYS_exit_group),
-    Rule::Any(libc::SYS_rt_sigreturn),
 ];
+
+/// Allowed only in debug builds (tests): std checks that a descriptor is
+/// open (fcntl F_GETFD) before closing it. Release builds never do, so the
+/// image never allows it.
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub const DEBUG_ALLOWLIST: &[Rule] = &[Rule::Args(libc::SYS_fcntl, &[&[(1, v(libc::F_GETFD))]])];
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+pub const DEBUG_ALLOWLIST: &[Rule] = &[];
 
 /// The allowlist compiled at build time into a scratch buffer, which never
 /// reaches the binary: only `FILTER`, cut to size from it, does.
@@ -299,7 +319,7 @@ pub const ALLOWLIST: &[Rule] = &[
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-const COMPILED: Program<256> = compile(ARCH, X32_GUARD, ALLOWLIST);
+const COMPILED: Program<256> = compile(ARCH, X32_GUARD, &[ALLOWLIST, DEBUG_ALLOWLIST]);
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -541,7 +561,7 @@ mod tests {
 
     /// The used part of a filter compiled at run time, as tests need it.
     fn compiled(arch: u32, x32_guard: bool, rules: &[Rule]) -> Vec<Insn> {
-        let program = compile::<256>(arch, x32_guard, rules);
+        let program = compile::<256>(arch, x32_guard, &[rules]);
         program.insns[..program.len].to_vec()
     }
 
@@ -659,15 +679,50 @@ mod tests {
         assert_eq!(call(libc::SYS_write, [1, 0, 0, 0, 0, 0]), RET_KILL_PROCESS);
         let exec = [0, 4096, (libc::PROT_READ | libc::PROT_EXEC) as u64, 0, 0, 0];
         assert_eq!(call(libc::SYS_mmap, exec), RET_KILL_PROCESS);
+        // F_GETFD only in debug builds, where std checks descriptors.
+        let getfd = if cfg!(debug_assertions) {
+            RET_ALLOW
+        } else {
+            RET_KILL_PROCESS
+        };
         assert_eq!(
             call(libc::SYS_fcntl, [3, libc::F_GETFD as u64, 0, 0, 0, 0]),
-            RET_ALLOW
+            getfd
         );
         assert_eq!(
             call(libc::SYS_fcntl, [3, libc::F_SETFL as u64, 0, 0, 0, 0]),
             RET_KILL_PROCESS
         );
         assert_eq!(call(libc::SYS_sigaltstack, [0; 6]), RET_ALLOW);
+        // Never needed after lockdown, so never allowed: futex (a classic
+        // kernel exploit target), mprotect (no permission changes at all),
+        // writev, thread exit, and rt_sigreturn (sigreturn-oriented code).
+        for nr in [
+            libc::SYS_futex,
+            libc::SYS_mprotect,
+            libc::SYS_writev,
+            libc::SYS_exit,
+            libc::SYS_rt_sigreturn,
+        ] {
+            assert_eq!(
+                call(nr, [2, 0, 0, 0, 0, 0]),
+                RET_KILL_PROCESS,
+                "syscall {nr}"
+            );
+        }
+        // The allocator's madvise and mremap, and only those uses.
+        let advise = |advice: i32| call(libc::SYS_madvise, [0, 4096, advice as u64, 0, 0, 0]);
+        assert_eq!(advise(libc::MADV_FREE), RET_ALLOW);
+        assert_eq!(advise(libc::MADV_DONTNEED), RET_ALLOW);
+        assert_eq!(advise(libc::MADV_WILLNEED), RET_KILL_PROCESS);
+        assert_eq!(advise(libc::MADV_REMOVE), RET_KILL_PROCESS);
+        let remap = |flags: i32| call(libc::SYS_mremap, [0, 4096, 8192, flags as u64, 0, 0]);
+        assert_eq!(remap(0), RET_ALLOW);
+        assert_eq!(remap(libc::MREMAP_MAYMOVE), RET_ALLOW);
+        assert_eq!(
+            remap(libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED),
+            RET_KILL_PROCESS
+        );
         assert_eq!(call(libc::SYS_openat, [0; 6]), RET_KILL_PROCESS);
         // A panic may report and abort itself, at this thread only.
         let abrt = libc::SIGABRT as u64;
@@ -793,14 +848,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "longer than its buffer")]
     fn a_filter_that_does_not_fit_its_buffer_panics() {
-        compile::<8>(X86_64, true, RULES);
+        compile::<8>(X86_64, true, &[RULES]);
     }
 
     #[test]
     #[should_panic(expected = "longer than a BPF jump")]
     fn a_rule_body_past_a_bpf_jump_panics() {
         const MANY: &[(u8, Value)] = &[(0, Value::Is(1)); 64];
-        compile::<512>(X86_64, true, &[Rule::Args(1, &[MANY])]);
+        compile::<512>(X86_64, true, &[&[Rule::Args(1, &[MANY])]]);
     }
 
     #[test]
@@ -809,7 +864,7 @@ mod tests {
             200,
             &[&[(0, Value::ThreadId), (1, Value::Is(6))]],
         )];
-        let program = compile::<64>(X86_64, true, &rules);
+        let program = compile::<64>(X86_64, true, &[&rules]);
         let slot = program.tid_slot.expect("one thread-id slot");
         assert_eq!(
             (program.insns[slot].code, program.insns[slot].k),

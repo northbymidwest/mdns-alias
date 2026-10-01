@@ -8,6 +8,17 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Changed
+
+- The seccomp allowlist is smaller: futex, mprotect, writev, thread exit
+  and rt_sigreturn are no longer allowed (none is used after lockdown), so
+  nothing can change a mapping's permissions; madvise is limited to the
+  allocator's MADV_FREE and MADV_DONTNEED, and mremap to its plain and
+  MREMAP_MAYMOVE forms. fcntl(F_GETFD), needed only by debug builds, is no
+  longer in release builds.
+
 ## 0.3.0 - 2026-09-30
 
 ### Added
