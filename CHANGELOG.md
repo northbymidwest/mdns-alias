@@ -8,6 +8,28 @@ reason is still fresh rather than reconstructed from the log at release time.
 `RELEASING.md` has the rest; the workflow refuses to publish a version whose
 section is missing or empty, or to leave anything behind under `Unreleased`.
 
+## Unreleased
+
+### Added
+
+- A sandbox on Linux, applied once the sockets are open: rlimits, an
+  address-space limit, non-dumpable, no-new-privs, a deny-all Landlock ruleset, and a seccomp
+  allowlist of about twenty system calls that kills the process on anything
+  else. Layers the kernel lacks are logged and skipped; `--require-sandbox`
+  makes them fatal.
+- mdns-alias refuses to run as root.
+
+### Changed
+
+- Packets from senders that are not on-link for the arrival interface are
+  ignored (RFC 6762 section 11), so off-link hosts can no longer trigger
+  replies or the conflict exit.
+- Interfaces without multicast support are skipped.
+- On Linux, signals are read from a signalfd and interfaces are listed over
+  netlink, dropping `ctrlc` and `if-addrs` from the image and its second
+  thread: the binary is about 54 KB (9%) smaller.
+- CI tests Linux on musl, as the image ships. glibc builds are unsupported.
+
 ## 0.2.0 - 2026-09-30
 
 ### Changed

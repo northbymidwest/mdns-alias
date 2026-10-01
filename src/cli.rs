@@ -2,8 +2,7 @@
 
 use crate::wire::Name;
 
-pub const USAGE: &str =
-    "usage: mdns-alias [--target <name.local>] [--interface <name>]... <alias.local>...";
+pub const USAGE: &str = "usage: mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <alias.local>...";
 
 #[derive(Debug, PartialEq)]
 pub struct Cli {
@@ -12,17 +11,21 @@ pub struct Cli {
     pub interfaces: Vec<String>,
     /// Deduplicated, ignoring case.
     pub aliases: Vec<Name>,
+    /// Exit rather than run with any sandbox layer missing.
+    pub require_sandbox: bool,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut target = None;
     let mut interfaces = Vec::new();
     let mut aliases: Vec<Name> = Vec::new();
+    let mut require_sandbox = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--target" => target = Some(local_name(&args.next().ok_or(USAGE)?)?),
             "--interface" => interfaces.push(args.next().ok_or(USAGE)?),
+            "--require-sandbox" => require_sandbox = true,
             option if option.starts_with('-') => return Err(USAGE.into()),
             _ => {
                 let alias = local_name(&arg)?;
@@ -39,6 +42,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         target,
         interfaces,
         aliases,
+        require_sandbox,
     })
 }
 
@@ -191,6 +195,16 @@ mod tests {
         assert_eq!(
             target(&cli, Some("myhost")),
             Err("MYHOST.local is the target itself".to_string())
+        );
+    }
+
+    #[test]
+    fn require_sandbox_is_off_unless_asked_for() {
+        assert!(!parse(args(&["app.local"])).unwrap().require_sandbox);
+        assert!(
+            parse(args(&["--require-sandbox", "app.local"]))
+                .unwrap()
+                .require_sandbox
         );
     }
 }

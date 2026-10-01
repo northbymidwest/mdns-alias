@@ -8,12 +8,20 @@ description = "Publish extra mDNS host names for this machine, as CNAMEs of its 
 publish = false
 
 [dependencies]
-ctrlc = { version = "3.5.2", features = ["termination"] }
-# `link-local` keeps fe80:: addresses, often an interface's only IPv6 ones.
-if-addrs = { version = "0.15.0", features = ["link-local"] }
 # Reports the interface each packet arrived on, keeping `unsafe` out of here.
 socket-pktinfo = "0.4.1"
 socket2 = "0.6.5"
+
+# Signal handling and the sandbox; every raw call is in src/sys.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
+
+# Development platforms only. Linux reads signals from a signalfd and lists
+# interfaces over rtnetlink instead, so neither reaches the image.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+ctrlc = { version = "3.5.2", features = ["termination"] }
+# `link-local` keeps fe80:: addresses, often an interface's only IPv6 ones.
+if-addrs = { version = "0.15.0", features = ["link-local"] }
 
 [profile.release]
 codegen-units = 1

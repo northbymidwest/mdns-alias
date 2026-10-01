@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use socket_pktinfo::PktInfoUdpSocket;
@@ -31,6 +32,9 @@ pub struct Net {
     /// Named interfaces last reported as unserved, so each absence is logged
     /// once rather than on every rescan.
     unserved: Vec<String>,
+    /// Each served link's addresses and prefix lengths, for the source
+    /// check. Replaced on every successful rescan.
+    subnets: BTreeMap<Link, Vec<(IpAddr, u8)>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,6 +58,20 @@ pub struct Received {
     pub len: usize,
     pub link: Link,
     pub source: SocketAddr,
+}
+
+/// One address on one interface, whichever way the platform lists them.
+#[derive(Clone, Debug)]
+pub struct Interface {
+    pub name: String,
+    pub index: u32,
+    /// Administratively up and with a carrier.
+    pub up: bool,
+    pub loopback: bool,
+    pub point_to_point: bool,
+    pub multicast: bool,
+    pub addr: IpAddr,
+    pub prefix: u8,
 }
 
 impl Net {
@@ -80,6 +98,7 @@ impl Net {
             only,
             joined: BTreeMap::new(),
             unserved: Vec::new(),
+            subnets: BTreeMap::new(),
         };
         Ok((net, log))
     }
@@ -87,13 +106,15 @@ impl Net {
     /// Brings group membership in line with the interfaces present now.
     pub fn rescan(&mut self) -> Rescan {
         let mut scan = Rescan::default();
-        let want = match if_addrs::get_if_addrs() {
-            Ok(ifs) => wanted(&ifs, &self.only, &self.families()),
+        let ifs = match list_interfaces() {
+            Ok(ifs) => ifs,
             Err(e) => {
                 scan.log.push(format!("cannot list interfaces: {e}"));
                 return scan;
             }
         };
+        let want = wanted(&ifs, &self.only, &self.families());
+        self.subnets = subnets(&ifs, &want);
         let gone: Vec<Link> = self
             .joined
             .keys()
@@ -154,9 +175,15 @@ impl Net {
             Ok((len, info)) => {
                 // Index 0 is never a link we serve, so the packet is ignored.
                 let index = u32::try_from(info.if_index).unwrap_or(0);
+                let link = Link { index, family };
+                // Off-link senders (RFC 6762 section 11), and anything on a
+                // link we do not serve, never reach the responder.
+                if !accepted(&self.subnets, link, info.addr_src.ip()) {
+                    return Ok(None);
+                }
                 Ok(Some(Received {
                     len,
-                    link: Link { index, family },
+                    link,
                     source: info.addr_src,
                 }))
             }
@@ -219,6 +246,17 @@ impl Net {
             (Family::V6, _) => sock.leave_multicast_v6(&GROUP_V6, link.index),
             (Family::V4, None) => Ok(()),
         };
+    }
+
+    /// The highest descriptor the sockets hold, so the sandbox can cap new
+    /// descriptors just above it.
+    pub fn highest_fd(&self) -> i32 {
+        [&self.v4, &self.v6]
+            .into_iter()
+            .flatten()
+            .map(|sock| sock.as_raw_fd())
+            .max()
+            .unwrap_or(-1)
     }
 
     pub fn serves(&self, link: Link) -> bool {
@@ -306,23 +344,19 @@ fn socket(family: Family) -> io::Result<PktInfoUdpSocket> {
 }
 
 /// The links to serve: one per interface and family with an address there.
-/// Interfaces that are down, loopback or point-to-point never qualify.
-fn wanted(
-    ifs: &[if_addrs::Interface],
-    only: &[String],
-    families: &[Family],
-) -> BTreeMap<Link, Joined> {
-    // Loopback is a property of the interface, but if-addrs reports it per
+/// Interfaces that are down, loopback, point-to-point or without multicast
+/// never qualify.
+fn wanted(ifs: &[Interface], only: &[String], families: &[Family]) -> BTreeMap<Link, Joined> {
+    // Loopback is a property of the interface, but getifaddrs reports it per
     // address, and macOS gives lo0 a non-loopback fe80::1 too.
     let loopback: Vec<&str> = ifs
         .iter()
-        .filter(|i| i.is_loopback())
+        .filter(|i| i.loopback)
         .map(|i| i.name.as_str())
         .collect();
     let mut want = BTreeMap::new();
     for i in ifs {
-        let Some(index) = i.index else { continue };
-        if loopback.contains(&i.name.as_str()) || i.is_p2p() || !i.is_oper_up() {
+        if loopback.contains(&i.name.as_str()) || i.point_to_point || !i.up || !i.multicast {
             continue;
         }
         let chosen = if only.is_empty() {
@@ -335,14 +369,18 @@ fn wanted(
         if !chosen {
             continue;
         }
-        let (family, v4) = match i.ip() {
+        let (family, v4) = match i.addr {
             IpAddr::V4(addr) => (Family::V4, Some(addr)),
             IpAddr::V6(_) => (Family::V6, None),
         };
         if !families.contains(&family) {
             continue;
         }
-        want.entry(Link { index, family }).or_insert(Joined {
+        want.entry(Link {
+            index: i.index,
+            family,
+        })
+        .or_insert(Joined {
             name: i.name.clone(),
             v4,
         });
@@ -358,32 +396,127 @@ fn unserved(only: &[String], want: &BTreeMap<Link, Joined>) -> Vec<String> {
         .collect()
 }
 
+/// Each served link's addresses and prefix lengths.
+fn subnets(ifs: &[Interface], want: &BTreeMap<Link, Joined>) -> BTreeMap<Link, Vec<(IpAddr, u8)>> {
+    let mut out: BTreeMap<Link, Vec<(IpAddr, u8)>> = BTreeMap::new();
+    for i in ifs {
+        let family = if i.addr.is_ipv4() {
+            Family::V4
+        } else {
+            Family::V6
+        };
+        let link = Link {
+            index: i.index,
+            family,
+        };
+        if want.contains_key(&link) {
+            out.entry(link).or_default().push((i.addr, i.prefix));
+        }
+    }
+    out
+}
+
+/// Whether a packet from `source` on `link` may reach the responder: the
+/// link is served and the source is on-link there.
+fn accepted(subnets: &BTreeMap<Link, Vec<(IpAddr, u8)>>, link: Link, source: IpAddr) -> bool {
+    subnets.get(&link).is_some_and(|s| on_link(source, s))
+}
+
+/// Whether `source` is on-link for an interface with these addresses:
+/// inside one of its subnets, or IPv6 link-local.
+fn on_link(source: IpAddr, subnets: &[(IpAddr, u8)]) -> bool {
+    if let IpAddr::V6(v6) = source
+        && v6.is_unicast_link_local()
+    {
+        return true;
+    }
+    subnets
+        .iter()
+        .any(|&(addr, prefix)| same_prefix(source, addr, prefix))
+}
+
+fn same_prefix(a: IpAddr, b: IpAddr, prefix: u8) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix.min(32)))
+                .unwrap_or(0);
+            (a.to_bits() ^ b.to_bits()) & mask == 0
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix.min(128)))
+                .unwrap_or(0);
+            (a.to_bits() ^ b.to_bits()) & mask == 0
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn list_interfaces() -> io::Result<Vec<Interface>> {
+    use crate::netlink::{self, IFF_LOOPBACK, IFF_MULTICAST, IFF_POINTOPOINT, IFF_RUNNING, IFF_UP};
+    let (links, addrs) = netlink::dump()?;
+    Ok(addrs
+        .into_iter()
+        .filter_map(|a| {
+            let link = links.iter().find(|l| l.index == a.index)?;
+            let has = |flag: u32| link.flags & flag != 0;
+            Some(Interface {
+                name: link.name.clone(),
+                index: a.index,
+                up: has(IFF_UP) && has(IFF_RUNNING),
+                loopback: has(IFF_LOOPBACK),
+                point_to_point: has(IFF_POINTOPOINT),
+                multicast: has(IFF_MULTICAST),
+                addr: a.addr,
+                prefix: a.prefix,
+            })
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn list_interfaces() -> io::Result<Vec<Interface>> {
+    use if_addrs::IfAddr;
+    Ok(if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|i| {
+            let prefix = match &i.addr {
+                IfAddr::V4(a) => a.prefixlen,
+                IfAddr::V6(a) => a.prefixlen,
+            };
+            Some(Interface {
+                index: i.index?,
+                up: i.is_oper_up(),
+                loopback: i.is_loopback(),
+                point_to_point: i.is_p2p(),
+                // if-addrs does not report it; an interface without it fails
+                // to join the group, which is logged.
+                multicast: true,
+                addr: i.ip(),
+                prefix,
+                name: i.name,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Ifv6Addr, Interface};
 
     fn iface(name: &str, index: u32, ip: &str) -> Interface {
-        let addr = match ip.parse::<IpAddr>().unwrap() {
-            IpAddr::V4(ip) => IfAddr::V4(Ifv4Addr {
-                ip,
-                netmask: Ipv4Addr::new(255, 255, 255, 0),
-                prefixlen: 24,
-                broadcast: None,
-            }),
-            IpAddr::V6(ip) => IfAddr::V6(Ifv6Addr {
-                ip,
-                netmask: Ipv6Addr::UNSPECIFIED,
-                prefixlen: 64,
-                broadcast: None,
-            }),
-        };
+        let addr: IpAddr = ip.parse().unwrap();
         Interface {
             name: name.into(),
+            index,
+            up: true,
+            loopback: addr.is_loopback(),
+            point_to_point: false,
+            multicast: true,
             addr,
-            index: Some(index),
-            oper_status: IfOperStatus::Up,
-            is_p2p: false,
+            prefix: if addr.is_ipv4() { 24 } else { 64 },
         }
     }
 
@@ -398,9 +531,11 @@ mod tests {
     #[test]
     fn default_set_skips_loopback_containers_down_and_p2p() {
         let mut down = iface("wlo1", 3, "192.0.2.40");
-        down.oper_status = IfOperStatus::Down;
+        down.up = false;
         let mut tunnel = iface("utun0", 7, "fd00::1");
-        tunnel.is_p2p = true;
+        tunnel.point_to_point = true;
+        let mut no_multicast = iface("can0", 8, "192.0.2.50");
+        no_multicast.multicast = false;
         let ifs = [
             iface("lo", 1, "127.0.0.1"),
             iface("enp1s0", 2, "192.0.2.10"),
@@ -410,6 +545,7 @@ mod tests {
             iface("br-0123456789ab", 5, "172.20.0.1"),
             iface("veth1234", 6, "fe80::2"),
             tunnel,
+            no_multicast,
         ];
         assert_eq!(
             links(&wanted(&ifs, &[], &BOTH)),
@@ -485,5 +621,88 @@ mod tests {
         let only = ["enp1s0".to_string(), "wlan0".to_string(), "lo".to_string()];
         let want = wanted(&ifs, &only, &BOTH);
         assert_eq!(unserved(&only, &want), ["wlan0", "lo"]);
+    }
+    fn subnet(addr: &str, prefix: u8) -> (IpAddr, u8) {
+        (addr.parse().unwrap(), prefix)
+    }
+
+    #[test]
+    fn on_link_sources_are_in_a_subnet_or_ipv6_link_local() {
+        let subnets = [subnet("192.0.2.10", 24), subnet("2001:db8::10", 64)];
+        for (source, expected) in [
+            ("192.0.2.200", true),
+            ("192.0.3.1", false),
+            ("198.51.100.7", false),
+            ("2001:db8::99", true),
+            ("2001:db8:1::1", false),
+            ("fe80::1234", true),
+            ("::1", false),
+        ] {
+            assert_eq!(
+                on_link(source.parse().unwrap(), &subnets),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_lengths_at_the_edges() {
+        assert!(on_link(
+            "203.0.113.1".parse().unwrap(),
+            &[subnet("192.0.2.10", 0)]
+        ));
+        assert!(on_link(
+            "192.0.2.10".parse().unwrap(),
+            &[subnet("192.0.2.10", 32)]
+        ));
+        assert!(!on_link(
+            "192.0.2.11".parse().unwrap(),
+            &[subnet("192.0.2.10", 32)]
+        ));
+        assert!(!on_link(
+            "2001:db8::11".parse().unwrap(),
+            &[subnet("2001:db8::10", 128)]
+        ));
+        assert!(!on_link(
+            "192.0.2.10".parse().unwrap(),
+            &[subnet("2001:db8::10", 0)]
+        ));
+    }
+
+    #[test]
+    fn subnets_cover_only_served_links() {
+        let ifs = [
+            iface("enp1s0", 2, "192.0.2.10"),
+            iface("enp1s0", 2, "10.0.0.5"),
+            iface("docker0", 4, "172.17.0.1"),
+        ];
+        let subnets = subnets(&ifs, &wanted(&ifs, &[], &BOTH));
+        assert_eq!(subnets.len(), 1);
+        assert_eq!(
+            subnets[&Link {
+                index: 2,
+                family: Family::V4
+            }],
+            [subnet("192.0.2.10", 24), subnet("10.0.0.5", 24)]
+        );
+    }
+
+    #[test]
+    fn packets_on_unserved_links_are_never_accepted() {
+        let ifs = [iface("enp1s0", 2, "192.0.2.10")];
+        let subnets = subnets(&ifs, &wanted(&ifs, &[], &BOTH));
+        let served = Link {
+            index: 2,
+            family: Family::V4,
+        };
+        let other = Link {
+            index: 4,
+            family: Family::V4,
+        };
+        let source = "192.0.2.20".parse().unwrap();
+        assert!(accepted(&subnets, served, source));
+        assert!(!accepted(&subnets, other, source));
+        assert!(!accepted(&subnets, served, "198.51.100.7".parse().unwrap()));
     }
 }

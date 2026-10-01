@@ -39,12 +39,25 @@ jobs:
   # Linux is where this runs; macOS is where it gets developed, and has its
   # own responder (mDNSResponder) sharing port 5353. Windows is left out:
   # nothing here targets it.
+  #
+  # Linux tests run on musl, the only libc the image ships: the sandbox's
+  # syscall allowlist is musl's. Rust carries musl's C runtime with the
+  # target, so the runners need nothing installed.
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    # Through the environment, not interpolated into the scripts.
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,9 +65,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test
-      - run: cargo build --release
+      - run: cargo test --target "$TARGET"
+      - run: cargo build --release --target "$TARGET"
 
   # `test` above already runs the newest stable. This job is the release that
   # has not happened yet: a regression caught here is six weeks from reaching
@@ -69,8 +83,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: beta
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test
+      - run: cargo test --target x86_64-unknown-linux-musl
 
   # The floor is `rust-version` in the manifest, read from there rather than
   # repeated here: a bump that touched one and not the other would leave this
@@ -93,8 +108,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ steps.floor.outputs.version }}
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test
+      - run: cargo test --target x86_64-unknown-linux-musl
 
   # The floors in Cargo.toml are a promise: build against exactly these
   # versions and this works. Every other job resolves to the newest compatible
@@ -111,8 +127,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: nightly
+          targets: x86_64-unknown-linux-musl
       - run: cargo update -Z direct-minimal-versions
-      - run: cargo test
+      - run: cargo test --target x86_64-unknown-linux-musl
 
   # The parser reads whatever the LAN sends. A minute of fuzzing per run
   # keeps a regression from reaching an image; a crash fails the job and
@@ -133,6 +150,7 @@ jobs:
       # The prebuilt cargo-fuzz is a musl binary and defaults to its own
       # target, where the sanitizer cannot link. Name the runner's instead.
       - run: cargo fuzz run --target x86_64-unknown-linux-gnu parse -- -max_total_time=60
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu netlink -- -max_total_time=30
 
   # The image, on both architectures it will be pulled on, natively rather
   # than under emulation. Then the checks the image itself can answer: that
@@ -159,6 +177,24 @@ jobs:
           set -e
           printf '%s\n' "$out"
           [ "$code" -eq 1 ] && printf '%s\n' "$out" | grep -q '^mdns-alias: usage:'
+      # The image under its own sandbox, on both architectures: it starts,
+      # reports seccomp, answers an mDNS query for an alias, and stops
+      # cleanly on SIGTERM as PID 1 (exit 0, goodbyes sent).
+      - run: |
+          docker run -d --name smoke --network host --read-only --cap-drop ALL \
+            mdns-alias:ci --target ci-host.local smoke.ci-host.local
+          sleep 3
+          docker logs smoke
+          # Every layer but Landlock, which older runner kernels may lack,
+          # must have applied; "seccomp unavailable" would also match a
+          # looser pattern. (`! grep` would not fail the step under -e.)
+          docker logs smoke 2>&1 | grep -qE '^mdns-alias: sandbox: .*, seccomp$'
+          if docker logs smoke 2>&1 | grep -E 'sandbox: (rlimits|address-space limit|non-dumpable|no-new-privs|seccomp) unavailable'; then exit 1; fi
+          python3 scripts/mdns-query.py smoke.ci-host.local
+          [ "$(docker inspect -f '{{.State.Running}}' smoke)" = true ]
+          docker stop smoke > /dev/null
+          [ "$(docker inspect -f '{{.State.ExitCode}}' smoke)" = 0 ]
+          docker logs smoke 2>&1 | tail -1 | grep -q 'stopped'
       - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-audit@0.22.2

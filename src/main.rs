@@ -1,20 +1,20 @@
 //! Publish extra mDNS host names for this machine, as CNAMEs of its own
 //! `.local` name.
 //!
-//! Usage: `mdns-alias [--target <name.local>] [--interface <name>]... <alias.local>...`
+//! Usage: `mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <alias.local>...`
 
 #![forbid(unsafe_code)]
 
 use std::error::Error;
 use std::hash::{BuildHasher, RandomState};
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use mdns_alias::cli;
 use mdns_alias::net::Net;
 use mdns_alias::responder::{Family, Notice, Responder, Step};
+use mdns_alias::sandbox;
+use mdns_alias::signals::Signals;
 
 /// The kernel host name on Linux, where this is deployed. Elsewhere the
 /// read fails and `--target` is required.
@@ -36,28 +36,38 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = cli::parse(std::env::args().skip(1))?;
+    #[cfg(target_os = "linux")]
+    if mdns_alias::sys::is_root() {
+        return Err("refusing to run as root; run as an unprivileged user".into());
+    }
     let hostname = std::fs::read_to_string(HOSTNAME_FILE).ok();
     let target = cli::target(&cli, hostname.as_deref())?;
     // Only for probe jitter, so a hash of the pid with a random key is plenty.
     let seed = RandomState::new().hash_one(std::process::id());
     let mut responder = Responder::new(cli.aliases.clone(), target.clone(), seed)?;
+    let signals = Signals::new()?;
     let (mut net, log) = Net::open(cli.interfaces)?;
     for line in log {
         eprintln!("mdns-alias: {line}");
+    }
+    // Everything that needs files, new sockets or privileges is done; shed
+    // the ability to do any of it again.
+    let report = sandbox::lock(net.highest_fd().max(signals.raw_fd()).max(2));
+    for line in report.lines() {
+        eprintln!("mdns-alias: {line}");
+    }
+    if cli.require_sandbox && !report.complete() {
+        return Err("--require-sandbox: not every sandbox layer could be applied".into());
     }
     for alias in &cli.aliases {
         eprintln!("mdns-alias: publishing {alias} -> {target}");
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;
-
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
     let mut next_rescan = 0;
     let mut buf = vec![0; MAX_MESSAGE];
-    while !stop.load(Ordering::Relaxed) {
+    while !signals.pending() {
         if now() >= next_rescan {
             rescan(&mut net, &mut responder, now());
             next_rescan = now() + RESCAN_INTERVAL;

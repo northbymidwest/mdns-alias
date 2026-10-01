@@ -21,4 +21,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "netlink"
+path = "fuzz_targets/netlink.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

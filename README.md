@@ -7,7 +7,7 @@ machine their own `.local` names, such as `app.myhost.local`, that follow the
 machine's address wherever DHCP puts it.
 
 ```sh
-mdns-alias [--target <name.local>] [--interface <name>]... <alias.local>...
+mdns-alias [--target <name.local>] [--interface <name>]... [--require-sandbox] <alias.local>...
 mdns-alias app.myhost.local media.myhost.local
 ```
 
@@ -50,16 +50,50 @@ services:
     command: ["app.myhost.local"]
     read_only: true
     cap_drop: [ALL]
-    security_opt: [no-new-privileges]
     restart: unless-stopped
 ```
 
-`no-new-privileges` can stop the container from starting at all on some
-Docker installs, notably the Ubuntu snap: its AppArmor setup needs a profile
-transition to exec the binary, which `no-new-privileges` forbids, and the
-container exits with `exec /mdns-alias: operation not permitted`. If that
-happens, drop that line; the non-root user, `cap_drop: [ALL]` and the
-read-only filesystem still apply.
+The binary sets no-new-privileges on itself once started, so the compose
+`no-new-privileges` option adds nothing. Leave it out: on some Docker
+installs, notably the Ubuntu snap, it stops the container from starting at
+all (`exec /mdns-alias: operation not permitted`), because exec'ing the
+binary needs an AppArmor profile transition that the option forbids.
+
+## Sandbox
+
+On Linux, once its sockets are open, mdns-alias sheds everything it no
+longer needs:
+
+- rlimits: no new processes, no core dumps, and file descriptors capped
+  just above those in use.
+- An address-space limit just above the size in use (read from
+  `/proc/self/statm`, which Docker always mounts; without `/proc` only this
+  layer is skipped).
+- Non-dumpable and no-new-privs: nothing can ptrace it or read its memory,
+  and nothing it runs could gain privileges.
+- Landlock: no filesystem access at all, no TCP, no abstract Unix sockets,
+  no signals to other processes.
+- seccomp: about twenty system calls, some limited by argument (only
+  netlink sockets, only multicast socket options, writes only to stderr,
+  never executable memory). Anything else kills the process.
+
+It also ignores packets from senders that are not on the local network of
+the interface they arrived on.
+
+It refuses to run as root. Layers the kernel does not support are skipped
+and logged at startup:
+
+```
+mdns-alias: sandbox: rlimits, address-space limit, non-dumpable, no-new-privs, landlock ABI 8, seccomp
+```
+
+`--require-sandbox` makes a missing layer fatal instead. On macOS, a
+development platform here, there is no sandbox.
+
+Build Linux binaries for musl (`x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`), as the image does. The seccomp allowlist is
+tested against musl's system calls only; a glibc build is unsupported and
+may be killed by its own sandbox.
 
 ## How it works
 
