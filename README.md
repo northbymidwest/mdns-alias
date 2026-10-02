@@ -1,5 +1,8 @@
 # mdns-alias
 
+[![github](https://img.shields.io/badge/github-northbymidwest%2Fmdns--alias-blue?logo=github)](https://github.com/northbymidwest/mdns-alias)
+[![CI](https://github.com/northbymidwest/mdns-alias/actions/workflows/ci.yml/badge.svg)](https://github.com/northbymidwest/mdns-alias/actions/workflows/ci.yml)
+
 Publishes extra `.local` names for a machine, answered with the machine's own
 addresses, alongside whatever mDNS responder the host already runs
 (systemd-resolved, Avahi, mDNSResponder). Useful for giving services on one
