@@ -19,19 +19,19 @@ its own responder already publishes it.
 ## Docker
 
 Released images are at `ghcr.io/northbymidwest/mdns-alias:<version>`, for
-`linux/amd64` and `linux/arm64`. The current release is `0.5.2`. `latest`
+`linux/amd64` and `linux/arm64`. The current release is `0.6.0`. `latest`
 follows the newest release; pin a version (or a digest) for anything you
 deploy. Each release carries build provenance and SBOM attestations:
 
 ```sh
-gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.5.2 \
+gh attestation verify oci://ghcr.io/northbymidwest/mdns-alias:0.6.0 \
   --owner northbymidwest
 ```
 
 ```yaml
 services:
   mdns-alias:
-    image: ghcr.io/northbymidwest/mdns-alias:0.5.2
+    image: ghcr.io/northbymidwest/mdns-alias:0.6.0
     network_mode: host
     command: ["app.local", "media.local"]
     read_only: true
