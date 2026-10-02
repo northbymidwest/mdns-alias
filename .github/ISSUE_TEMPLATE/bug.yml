@@ -36,7 +36,7 @@ body:
     attributes:
       label: Command line
       description: How the daemon was started, with its arguments.
-      placeholder: "mdns-alias 192.0.2.10 app.myhost.local"
+      placeholder: "mdns-alias app.local media.local"
     validations:
       required: true
 
@@ -54,7 +54,7 @@ body:
     attributes:
       label: Client
       description: The OS doing the lookup, and how you looked the name up.
-      placeholder: "macOS 26, dscacheutil -q host -a name app.myhost.local"
+      placeholder: "macOS 26, dscacheutil -q host -a name app.local"
     validations:
       required: true
 

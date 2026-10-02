@@ -3,7 +3,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::process::ExitStatusExt;
@@ -87,6 +87,7 @@ fn seccomp_allows_the_steady_state() {
         let sender = UdpSocket::bind(local).unwrap();
         let v6 = PktInfoUdpSocket::new(Domain::IPV6).ok();
         let events = netlink::subscribe().unwrap();
+        let mut dumper = netlink::Dumper::open().unwrap();
         receiver.set_nonblocking(true).unwrap();
         // As the main loop fills them: IPv4, IPv6 (-1 without), the
         // notification socket, the signalfd.
@@ -97,9 +98,13 @@ fn seccomp_allows_the_steady_state() {
             signals.fd().unwrap(),
         ];
         seccomp();
-        // A rescan: the netlink dump, then joining and leaving groups. On
-        // loopback the joins may fail; the calls just must not be killed.
-        let rescanned = netlink::dump().is_ok();
+        // A rescan: the netlink dump over the socket opened before
+        // lockdown (twice, as every rescan reuses it), then joining and
+        // leaving groups. On loopback the joins may fail; the calls just
+        // must not be killed. The filter allows no socket(), so a dump that
+        // opened one would kill the child here.
+        let rescanned =
+            dumper.dump().is_ok_and(|(links, _)| !links.is_empty()) && dumper.dump().is_ok();
         let group = Ipv4Addr::new(224, 0, 0, 251);
         let _ = receiver.join_multicast_v4(&group, &Ipv4Addr::LOCALHOST);
         let _ = receiver.leave_multicast_v4(&group, &Ipv4Addr::LOCALHOST);
@@ -181,12 +186,16 @@ fn seccomp_allows_an_error_exit() {
     let Some(status) = in_child("seccomp_allows_an_error_exit") else {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         seccomp();
-        // As main does on a conflict: format and log the error, drop it and
-        // the sockets, and exit with status 1 through std's cleanup.
-        let error: Box<dyn std::error::Error> = Box::new(Conflict {
+        // Log a conflict as the loop does, then fail as main does on a fatal
+        // error: format and log the error, drop it and the sockets, and exit
+        // with status 1 through std's cleanup.
+        let conflict = Conflict {
             alias: Name::parse("app.myhost.local").unwrap(),
             source: "192.0.2.30".parse().unwrap(),
-        });
+        };
+        eprintln!("mdns-alias: {conflict}; probing again");
+        let error: Box<dyn std::error::Error> =
+            format!("cannot wait for packets after {conflict}").into();
         eprintln!("mdns-alias: {error}");
         drop(error);
         drop(socket);
@@ -208,11 +217,12 @@ fn highest_fd() -> i32 {
 #[test]
 fn full_lockdown_still_rescans() {
     let Some(status) = in_child("full_lockdown_still_rescans") else {
+        let mut dumper = netlink::Dumper::open().unwrap();
         let report = sandbox::lock([highest_fd()]);
         let sealed = report.applied(Layer::Seccomp);
-        // Twice: the descriptor cap must leave room for the netlink socket
-        // on every rescan, not just the first.
-        let rescans = netlink::dump().is_ok() && netlink::dump().is_ok();
+        // Twice: every rescan reuses the socket opened before lockdown,
+        // which opens nothing new under the descriptor cap.
+        let rescans = dumper.dump().is_ok() && dumper.dump().is_ok();
         exit_now(if sealed && rescans { 0 } else { 3 });
     };
     assert!(status.success(), "{status:?}");
@@ -273,6 +283,26 @@ fn seccomp_kills_new_ip_sockets() {
     let Some(status) = in_child("seccomp_kills_new_ip_sockets") else {
         seccomp();
         let _ = std::net::UdpSocket::bind(("127.0.0.1", 0));
+        exit_now(0);
+    };
+    assert_killed(status);
+}
+
+#[test]
+fn seccomp_kills_new_netlink_sockets() {
+    let Some(status) = in_child("seccomp_kills_new_netlink_sockets") else {
+        seccomp();
+        // socket() alone: Dumper::open would bind next, which the filter
+        // kills too, so it could not tell whether socket() was allowed.
+        // SAFETY: socket takes integers and touches no memory; the call is
+        // expected to kill the process.
+        unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
         exit_now(0);
     };
     assert_killed(status);
@@ -386,7 +416,8 @@ fn logging_to_a_file_survives_the_full_lockdown() {
     // Every layer applied, seccomp last; only Landlock may be missing, on
     // kernels without it. A "seccomp unavailable" line must not pass.
     let lines: Vec<&str> = text.lines().collect();
-    let first = "sandbox: rlimits, address-space limit, non-dumpable, no-new-privs, ";
+    let first = "sandbox: rlimits, address-space limit, capability drop, non-dumpable, \
+                 no-new-privs, ";
     assert!(lines[0].starts_with(first), "{text}");
     assert!(lines[0].ends_with(", seccomp"), "{text}");
     assert!(
@@ -485,4 +516,105 @@ fn the_notification_socket_is_bound_and_subscribed() {
         | bit(netlink::RTNLGRP_IPV6_IFADDR);
     assert_ne!(pid, 0, "socket is not bound");
     assert_eq!(groups, want, "group mask {groups:#x}");
+}
+
+/// The capability sets in a /proc/<pid>/status, by name (`CapEff`, ...), as
+/// masks.
+fn capability_sets(status: &str) -> Vec<(String, u64)> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let (name, mask) = line.split_once(":\t")?;
+            let name = name.strip_prefix("Cap")?;
+            Some((name.to_string(), u64::from_str_radix(mask.trim(), 16).ok()?))
+        })
+        .collect()
+}
+
+/// Every capability set is empty once the full lockdown is in place, read
+/// from outside: the locked-down child can open no file, so the parent
+/// reads the locked thread's /proc/<pid>/task/<tid>/status while it waits.
+/// Capabilities are per thread, and the test harness runs the test on a
+/// thread of its own. As root (a test container run as root with
+/// CAP_NET_ADMIN) the child starts with capabilities, CAP_SETPCAP among
+/// them, and must end with none, bounding set included. Unprivileged, it
+/// starts with empty sets and an unreachable bounding set, which the
+/// lockdown must leave as harmless, not report as a failure.
+#[test]
+fn lockdown_empties_every_capability_set() {
+    const NAME: &str = "lockdown_empties_every_capability_set";
+    if std::env::var_os(CHILD).is_some() {
+        let before = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let before: Vec<String> = capability_sets(&before)
+            .into_iter()
+            .map(|(name, mask)| format!("Cap{name}={mask:x}"))
+            .collect();
+        eprintln!("before {}", before.join(" "));
+        let report = sandbox::lock([highest_fd()]);
+        let dropped = report.applied(Layer::Capabilities);
+        let sealed = report.applied(Layer::Seccomp);
+        // Capabilities are per thread, and this is not the main one: the
+        // parent reads this thread's status, not the process's.
+        eprintln!("locked {dropped} {sealed} {}", sys::thread_id());
+        // Wait for the parent to close stdin, which wakes the wait.
+        let mut fds = [0, -1, -1, -1].map(sys::poll_entry);
+        let _ = sys::poll(&mut fds, Duration::from_secs(30));
+        exit_now(0);
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            NAME,
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+            "--quiet",
+        ])
+        .env(CHILD, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut next = |prefix: &str| {
+        lines
+            .by_ref()
+            .map(Result::unwrap)
+            .find_map(|l| l.strip_prefix(prefix).map(str::to_string))
+            .unwrap_or_else(|| panic!("child never said {prefix:?}"))
+    };
+    let before = next("before ");
+    let locked = next("locked ");
+    let (locked, tid) = locked.rsplit_once(' ').unwrap();
+    let path = format!("/proc/{}/task/{tid}/status", child.id());
+    let after = std::fs::read_to_string(path).unwrap();
+    drop(child.stdin.take());
+    let status = child.wait().unwrap();
+    eprintln!("capabilities before lockdown: {before}");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(locked, "true true", "capability drop and seccomp applied");
+    let after = capability_sets(&after);
+    eprintln!("capabilities after lockdown: {after:x?}");
+    // Every set but the bounding one: inheritable, permitted, effective and
+    // ambient, all four of which the kernel reports.
+    let sets: Vec<_> = after.iter().filter(|(name, _)| name != "Bnd").collect();
+    assert_eq!(sets.len(), 4, "{after:?}");
+    for (name, mask) in sets {
+        assert_eq!(*mask, 0, "Cap{name} after lockdown");
+    }
+    // With CAP_SETPCAP to drop it, the bounding set empties too.
+    let had_setpcap = before
+        .split(' ')
+        .find_map(|set| set.strip_prefix("CapEff="))
+        .and_then(|mask| u64::from_str_radix(mask, 16).ok())
+        .is_some_and(|mask| mask & 1 << sys::CAP_SETPCAP != 0);
+    if had_setpcap {
+        let bounding = after.iter().find(|(n, _)| n == "Bnd").map(|&(_, m)| m);
+        assert_eq!(bounding, Some(0), "CapBnd after lockdown");
+    }
+    // Root always starts with capabilities, so as root this proves a drop.
+    // SAFETY: geteuid cannot fail and touches no memory.
+    if unsafe { libc::geteuid() } == 0 {
+        assert!(had_setpcap, "root without CAP_SETPCAP: {before}");
+    }
 }

@@ -4,7 +4,7 @@ version = "0.5.2"
 edition = "2024"
 rust-version = "1.98"
 license = "0BSD"
-description = "Publish extra mDNS host names for this machine, as address records or as CNAMEs of its own name"
+description = "Publish extra mDNS host names for this machine, answered with its addresses"
 publish = false
 
 [dependencies]

@@ -1,7 +1,7 @@
-//! Publish extra mDNS host names for this machine, as address records by
-//! default, or as CNAMEs of its own `.local` name with `--cname`.
+//! Publish extra mDNS host names for this machine, answered with its
+//! addresses.
 //!
-//! Usage: `mdns-alias [--host <name.local>] [--cname] [--interface <name>]... [--require-sandbox] <name>...`
+//! Usage: `mdns-alias [--interface <name>]... [--require-sandbox] <name.local>...`
 
 #![forbid(unsafe_code)]
 

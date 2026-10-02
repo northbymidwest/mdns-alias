@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Asks for NAME's A records over mDNS from an ephemeral port, a legacy
 unicast query (RFC 6762 section 6.7), and exits 0 if the reply's answers
-include a record of type EXPECT (A, the default, or CNAME).
+include an A record.
 
-    scripts/mdns-query.py NAME [A|CNAME]
+    scripts/mdns-query.py NAME
 """
 import socket
 import struct
 import sys
 
+A = 1
+if len(sys.argv) != 2 or not sys.argv[1]:
+    print("usage: mdns-query.py NAME", file=sys.stderr)
+    sys.exit(2)
 name = sys.argv[1]
-expect = {"A": 1, "CNAME": 5}[sys.argv[2] if len(sys.argv) > 2 else "A"]
 
 query = struct.pack(">HHHHHH", 0x1234, 0, 1, 0, 0, 0)
 for label in name.rstrip(".").split("."):
@@ -52,6 +55,6 @@ try:
 except (IndexError, struct.error):
     print("truncated or malformed reply (%d bytes)" % len(reply))
     sys.exit(1)
-ok = ident == 0x1234 and expect in types
-print("answer types %s, expected %d" % (types, expect))
+ok = ident == 0x1234 and A in types
+print("answer types %s, expected %d" % (types, A))
 sys.exit(0 if ok else 1)

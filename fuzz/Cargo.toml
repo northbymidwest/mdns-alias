@@ -28,4 +28,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "responder"
+path = "fuzz_targets/responder.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

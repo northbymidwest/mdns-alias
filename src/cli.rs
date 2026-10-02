@@ -1,36 +1,33 @@
-//! The command line, and the host name it implies.
+//! The command line.
 
 use crate::wire::Name;
 
-const USAGE: &str = "usage: mdns-alias [--host <name.local>] [--cname] [--interface <name>]... [--require-sandbox] <name>...";
+const USAGE: &str = "usage: mdns-alias [--interface <name>]... [--require-sandbox] <name.local>...";
 
 #[derive(Debug, PartialEq)]
 pub struct Cli {
-    /// The base for relative names, and the CNAME target in `--cname` mode.
-    host: Option<Name>,
     /// `--interface` names; empty means the default set.
     pub interfaces: Vec<String>,
-    /// The names as given: relative to the host unless they end in
-    /// `.local` (or a dot). `resolve` expands them.
-    names: Vec<String>,
-    /// Publish CNAMEs of the host instead of address records.
-    pub cname: bool,
+    /// The aliases, each a full `.local` name, deduplicated ignoring case,
+    /// in the order given.
+    pub aliases: Vec<Name>,
     /// Exit rather than run with any sandbox layer missing.
     pub require_sandbox: bool,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
-    let mut host = None;
     let mut interfaces = Vec::new();
     let mut names = Vec::new();
-    let mut cname = false;
     let mut require_sandbox = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if let Some(option) = removed(&arg) {
+            return Err(format!(
+                "{option} was removed: aliases are published as address records, \
+                 and each is a full name ending in .local\n{USAGE}"
+            ));
+        }
         match arg.as_str() {
-            "--host" => host = Some(local_name(&args.next().ok_or(USAGE)?)?),
-            "--target" => return Err(format!("--target is now --host\n{USAGE}")),
-            "--cname" => cname = true,
             "--interface" => interfaces.push(args.next().ok_or(USAGE)?),
             "--require-sandbox" => require_sandbox = true,
             option if option.starts_with('-') => return Err(USAGE.into()),
@@ -40,69 +37,98 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     if names.is_empty() {
         return Err(USAGE.into());
     }
-    Ok(Cli {
-        host,
-        interfaces,
-        names,
-        cname,
-        require_sandbox,
-    })
-}
-
-/// The host every alias points at, and the aliases, deduplicated ignoring
-/// case. The host is `--host`, or else this host's own `.local` name,
-/// made from the first label of `hostname` (the kernel host name, when it
-/// could be read). Relative names are expanded under it.
-pub fn resolve(cli: &Cli, hostname: Option<&str>) -> Result<(Name, Vec<Name>), String> {
-    let host_target = match (&cli.host, hostname) {
-        (Some(host), _) => host.clone(),
-        (None, Some(hostname_str)) => {
-            let first = hostname_str.trim().split('.').next().unwrap_or_default();
-            Name::parse(&format!("{first}.local")).map_err(|_| {
-                format!(
-                    "cannot make a .local name from host name {hostname_str:?}; pass --host <name.local>"
-                )
-            })?
-        }
-        (None, None) => {
-            return Err("cannot read this host's name; pass --host <name.local>".into());
-        }
-    };
     let mut aliases: Vec<Name> = Vec::new();
-    for text in &cli.names {
-        let alias = alias(text, &host_target)?;
-        if alias == host_target {
-            return Err(format!("{alias} is the host itself"));
-        }
+    for text in &names {
+        let alias = alias(text)?;
         if !aliases.contains(&alias) {
             aliases.push(alias);
         }
     }
-    Ok((host_target, aliases))
+    Ok(Cli {
+        interfaces,
+        aliases,
+        require_sandbox,
+    })
 }
 
-/// `text` as a full name. Absolute if it ends in `.local`, or in a dot as
-/// in DNS; otherwise relative, under `host`: `seerr` is
-/// `seerr.<host>`.
-fn alias(text: &str, host: &Name) -> Result<Name, String> {
-    if text.ends_with('.') {
-        return local_name(text);
-    }
-    let name = Name::parse(text).map_err(|e| format!("invalid name {text:?}: {e}"))?;
-    if name.is_local() {
-        return Ok(name);
-    }
-    name.under(host)
-        .map_err(|e| format!("invalid name {text:?} under {host}: {e}"))
+/// The removed option `arg` is, alone or as `--option=value`.
+fn removed(arg: &str) -> Option<&'static str> {
+    ["--cname", "--host", "--target"]
+        .into_iter()
+        .find(|option| {
+            arg.strip_prefix(option)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+        })
 }
 
-fn local_name(text: &str) -> Result<Name, String> {
+/// `text` as an alias: a valid name ending in `.local` (a trailing dot, as
+/// in DNS, is allowed), every label of it a valid host name label.
+/// Several labels before `.local` are fine (`api.app.local`). A name
+/// without `.local` gets `<name>.local` suggested only when that would be
+/// a sensible alias: a single valid label, other than `local` itself.
+fn alias(text: &str) -> Result<Name, String> {
     let name = Name::parse(text).map_err(|e| format!("invalid name {text:?}: {e}"))?;
+    if let Some(label) = bad_label(&name) {
+        return Err(format!(
+            "invalid name {:?}: label {label:?} {LABEL_RULE}",
+            name.to_string()
+        ));
+    }
     if !name.is_local() {
-        return Err(format!("{name} is not a .local name"));
+        let bare = text.strip_suffix('.').unwrap_or(text);
+        if name.labels().count() == 1 && !bare.eq_ignore_ascii_case("local") {
+            return Err(format!("{text:?} is not a .local name; write {bare}.local"));
+        }
+        return Err(format!(
+            "{text:?} is not a .local name; an alias must end in .local"
+        ));
     }
     Ok(name)
 }
+
+/// This machine's own `.local` name, made from its host name (the
+/// kernel's, as `uname` gives it): the first label, plus `.local`. `None`
+/// if that is not a valid alias.
+fn own_name(host_name: &str) -> Option<Name> {
+    let first = host_name.trim().split('.').next()?;
+    let name = Name::parse(&format!("{first}.local")).ok()?;
+    bad_label(&name).is_none().then_some(name)
+}
+
+/// Refuses an alias that is this machine's own `.local` name, made from
+/// `host_name` (see `own_name`): the host's responder already publishes
+/// it, and our goodbyes on shutdown would withdraw it from caches. Without
+/// a host name, or with one that makes no valid name, nothing is checked.
+pub fn check_own_name(aliases: &[Name], host_name: Option<&str>) -> Result<(), String> {
+    let Some(own) = host_name.and_then(own_name) else {
+        return Ok(());
+    };
+    match aliases.iter().find(|alias| **alias == own) {
+        Some(alias) => Err(format!(
+            "{alias} is this machine's own name ({own}); its responder already publishes it"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The first label of `name` that is not a valid host name label: ASCII
+/// letters, digits and hyphens only, not starting or ending with a hyphen
+/// (RFC 1123 section 2.1). This is the command line's rule for what to
+/// publish; the wire code still accepts any bytes from the network.
+fn bad_label(name: &Name) -> Option<String> {
+    name.labels()
+        .find(|label| {
+            !label
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+                || label.starts_with(b"-")
+                || label.ends_with(b"-")
+        })
+        .map(|label| String::from_utf8_lossy(label).into_owned())
+}
+
+const LABEL_RULE: &str =
+    "must be only ASCII letters, digits and hyphens, and not start or end with a hyphen";
 
 #[cfg(test)]
 mod tests {
@@ -116,33 +142,29 @@ mod tests {
         Name::parse(text).unwrap()
     }
 
-    /// Parses `list`, then resolves it against the host name `myhost`.
-    fn resolved(list: &[&str]) -> Result<(Name, Vec<Name>), String> {
-        resolve(&parse(args(list))?, Some("myhost\n"))
-    }
-
     fn names(list: &[&str]) -> Vec<Name> {
         list.iter().map(|n| name(n)).collect()
+    }
+
+    /// The aliases `list` parses to.
+    fn aliases(list: &[&str]) -> Result<Vec<Name>, String> {
+        parse(args(list)).map(|cli| cli.aliases)
     }
 
     #[test]
     fn parses_names_and_options() {
         let cli = parse(args(&[
-            "--host",
-            "myhost.local",
-            "seerr",
+            "app.local",
             "--interface",
             "enp1s0",
             "--interface",
             "wlo1",
-            "app.other.local",
+            "media.local",
             "--require-sandbox",
         ]))
         .unwrap();
-        assert_eq!(cli.host, Some(name("myhost.local")));
         assert_eq!(cli.interfaces, ["enp1s0", "wlo1"]);
-        assert_eq!(cli.names, ["seerr", "app.other.local"]);
-        assert!(!cli.cname);
+        assert_eq!(cli.aliases, names(&["app.local", "media.local"]));
         assert!(cli.require_sandbox);
     }
 
@@ -150,154 +172,170 @@ mod tests {
     fn needs_at_least_one_name() {
         assert_eq!(parse(args(&[])), Err(USAGE.to_string()));
         assert_eq!(
-            parse(args(&["--host", "myhost.local"])),
+            parse(args(&["--interface", "eth0"])),
             Err(USAGE.to_string())
         );
     }
 
     #[test]
     fn rejects_unknown_options_and_missing_values() {
-        assert_eq!(parse(args(&["-v", "seerr"])), Err(USAGE.to_string()));
-        assert_eq!(parse(args(&["seerr", "--host"])), Err(USAGE.to_string()));
+        assert_eq!(parse(args(&["-v", "app.local"])), Err(USAGE.to_string()));
         assert_eq!(
-            parse(args(&["seerr", "--interface"])),
+            parse(args(&["app.local", "--interface"])),
             Err(USAGE.to_string())
         );
     }
 
     #[test]
     fn require_sandbox_is_off_unless_asked_for() {
-        assert!(!parse(args(&["seerr"])).unwrap().require_sandbox);
+        assert!(!parse(args(&["app.local"])).unwrap().require_sandbox);
         assert!(
-            parse(args(&["--require-sandbox", "seerr"]))
+            parse(args(&["--require-sandbox", "app.local"]))
                 .unwrap()
                 .require_sandbox
         );
     }
 
     #[test]
-    fn the_host_must_be_a_local_name() {
+    fn the_removed_options_say_so() {
+        for option in ["--cname", "--host", "--target"] {
+            let expected = Err(format!(
+                "{option} was removed: aliases are published as address records, \
+                 and each is a full name ending in .local\n{USAGE}"
+            ));
+            assert_eq!(
+                parse(args(&[option, "myhost.local", "app.local"])),
+                expected
+            );
+            let joined = format!("{option}=myhost.local");
+            assert_eq!(parse(args(&[&joined, "app.local"])), expected);
+        }
+        // Only those options: one that merely starts the same is unknown.
         assert_eq!(
-            parse(args(&["--host", "myhost", "seerr"])),
-            Err("myhost is not a .local name".to_string())
+            parse(args(&["--hostname", "app.local"])),
+            Err(USAGE.to_string())
         );
     }
 
     #[test]
-    fn names_without_local_are_relative_to_the_host() {
-        let (host, aliases) = resolved(&["seerr", "api.seerr"]).unwrap();
-        assert_eq!(host, name("myhost.local"));
+    fn a_name_without_local_is_refused_with_the_fix() {
         assert_eq!(
-            aliases,
-            names(&["seerr.myhost.local", "api.seerr.myhost.local"])
+            aliases(&["app"]),
+            Err("\"app\" is not a .local name; write app.local".to_string())
+        );
+        assert_eq!(
+            aliases(&["app."]),
+            Err("\"app.\" is not a .local name; write app.local".to_string())
+        );
+    }
+
+    /// No suggestion where `<name>.local` would not be a sensible alias:
+    /// several labels, `local` alone, or a label that fails the rules,
+    /// which is reported as such.
+    #[test]
+    fn a_name_without_local_gets_no_suggestion_that_would_not_do() {
+        for text in ["api.app", "app.example.com", "local", "LOCAL."] {
+            assert_eq!(
+                aliases(&[text]),
+                Err(format!(
+                    "{text:?} is not a .local name; an alias must end in .local"
+                )),
+            );
+        }
+        assert_eq!(
+            aliases(&["my_app"]),
+            Err("invalid name \"my_app\": label \"my_app\" must be only ASCII letters, digits and hyphens, and not start or end with a hyphen".to_string())
         );
     }
 
     #[test]
-    fn names_ending_in_local_are_absolute() {
-        let (_, aliases) = resolved(&["app.other.local", "seerr", "TV.Local"]).unwrap();
+    fn the_own_name_is_the_first_label_of_the_host_name_under_local() {
+        assert_eq!(own_name("myhost"), Some(name("myhost.local")));
+        assert_eq!(own_name("MyHost.lan\n"), Some(name("myhost.local")));
+        for bad in ["", "\n", "my_host", ".lan", "-x"] {
+            assert_eq!(own_name(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_alias_that_is_this_machines_own_name_is_refused() {
+        let list = names(&["app.local", "MyHost.local"]);
         assert_eq!(
-            aliases,
-            names(&["app.other.local", "seerr.myhost.local", "tv.local"])
+            check_own_name(&list, Some("myhost.lan")),
+            Err("MyHost.local is this machine's own name (myhost.local); its responder already publishes it".to_string())
+        );
+        assert_eq!(check_own_name(&list, Some("media")), Ok(()));
+        // Several labels under the host name are other names.
+        assert_eq!(
+            check_own_name(&names(&["app.myhost.local"]), Some("myhost")),
+            Ok(())
+        );
+        // No host name, or one that makes no valid name: no check.
+        assert_eq!(check_own_name(&list, None), Ok(()));
+        assert_eq!(check_own_name(&list, Some("my_host")), Ok(()));
+    }
+
+    #[test]
+    fn names_are_used_as_given_and_may_have_several_labels() {
+        assert_eq!(
+            aliases(&["app.local", "api.app.local", "TV.Local", "media.local."]),
+            Ok(names(&[
+                "app.local",
+                "api.app.local",
+                "tv.local",
+                "media.local"
+            ]))
         );
     }
 
     #[test]
-    fn relative_names_follow_the_host_option() {
-        let (host, aliases) = resolved(&["--host", "nas.local", "files"]).unwrap();
-        assert_eq!(host, name("nas.local"));
-        assert_eq!(aliases, names(&["files.nas.local"]));
-    }
-
-    #[test]
-    fn a_trailing_dot_makes_a_name_absolute() {
-        let (_, aliases) = resolved(&["app.other.local."]).unwrap();
-        assert_eq!(aliases, names(&["app.other.local"]));
+    fn duplicates_collapse_ignoring_case() {
         assert_eq!(
-            resolved(&["seerr."]),
-            Err("seerr is not a .local name".to_string())
-        );
-    }
-
-    #[test]
-    fn duplicates_collapse_across_forms_ignoring_case() {
-        let (_, aliases) = resolved(&["seerr", "SEERR.myhost.local", "Seerr", "sonarr"]).unwrap();
-        assert_eq!(
-            aliases,
-            names(&["seerr.myhost.local", "sonarr.myhost.local"])
+            aliases(&["app.local", "APP.local", "media.local", "App.Local."]),
+            Ok(names(&["app.local", "media.local"]))
         );
     }
 
     #[test]
     fn rejects_malformed_names() {
         assert_eq!(
-            resolved(&["app..local"]),
+            aliases(&["app..local"]),
             Err("invalid name \"app..local\": empty label".to_string())
         );
+        let long = format!("{}.local", vec!["a".repeat(60); 5].join("."));
+        assert!(aliases(&[&long]).unwrap_err().contains("longer than 255"));
+    }
+
+    #[test]
+    fn rejects_labels_that_are_not_host_names() {
+        for bad in [
+            "my_app.local",
+            "my app.local",
+            "x.-app.local",
+            "app-.local",
+            "bj\u{f6}rn.local",
+            "a-.b.local",
+            "app!.local",
+        ] {
+            let Err(err) = aliases(&[bad]) else {
+                panic!("{bad:?} was accepted");
+            };
+            assert!(err.starts_with("invalid name \""), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_label_error_names_the_label_and_the_full_name() {
         assert_eq!(
-            resolved(&["a..b"]),
-            Err("invalid name \"a..b\": empty label".to_string())
+            aliases(&["my_app.local"]),
+            Err("invalid name \"my_app.local\": label \"my_app\" must be only ASCII letters, digits and hyphens, and not start or end with a hyphen".to_string())
         );
     }
 
     #[test]
-    fn rejects_relative_names_too_long_once_expanded() {
-        // Four 60-byte labels fit 255 bytes alone (245), not with
-        // ".myhost.local" appended.
-        let long = vec!["a".repeat(60); 4].join(".");
-        assert!(Name::parse(&long).is_ok());
-        assert_eq!(
-            resolved(&[&long]),
-            Err(format!(
-                "invalid name {long:?} under myhost.local: name longer than 255 bytes"
-            ))
-        );
-    }
-
-    #[test]
-    fn host_defaults_to_the_host_name() {
-        let cli = parse(args(&["seerr"])).unwrap();
-        assert_eq!(
-            resolve(&cli, Some("myhost.lan")).unwrap().0,
-            name("myhost.local")
-        );
-    }
-
-    #[test]
-    fn host_needs_a_host_name_or_the_option() {
-        let cli = parse(args(&["seerr"])).unwrap();
-        assert_eq!(
-            resolve(&cli, None),
-            Err("cannot read this host's name; pass --host <name.local>".to_string())
-        );
-        assert_eq!(
-            resolve(&cli, Some("\n")),
-            Err(
-                "cannot make a .local name from host name \"\\n\"; pass --host <name.local>"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn an_alias_cannot_be_the_host() {
-        assert_eq!(
-            resolved(&["MYHOST.local"]),
-            Err("MYHOST.local is the host itself".to_string())
-        );
-    }
-
-    #[test]
-    fn cname_mode_is_off_unless_asked_for() {
-        assert!(!parse(args(&["seerr"])).unwrap().cname);
-        assert!(parse(args(&["--cname", "seerr"])).unwrap().cname);
-    }
-
-    #[test]
-    fn the_old_target_option_is_gone() {
-        assert_eq!(
-            parse(args(&["--target", "myhost.local", "seerr"])),
-            Err(format!("--target is now --host\n{USAGE}"))
-        );
+    fn accepts_digits_mixed_case_and_full_length_labels() {
+        let long = format!("{}.local", "a".repeat(63));
+        let parsed = aliases(&["8080.local", "Web-2.local", &long, "a-b-c.local"]).unwrap();
+        assert_eq!(parsed.len(), 4);
     }
 }

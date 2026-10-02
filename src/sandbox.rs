@@ -309,11 +309,8 @@ const ALLOWLIST: &[Rule] = &[
             &[(1, v(libc::IPPROTO_IPV6)), (2, v(libc::IPV6_MULTICAST_IF))],
         ],
     },
-    // The rescan's netlink socket, and no other.
-    Rule::Args {
-        nr: libc::SYS_socket,
-        alternatives: &[&[(0, v(libc::AF_NETLINK)), (2, v(libc::NETLINK_ROUTE))]],
-    },
+    // No socket: every one the steady state uses, the rescans' netlink
+    // socket included, is opened before lockdown.
     Rule::Any(libc::SYS_close),
     // Logging, to stderr only.
     Rule::Args {
@@ -321,9 +318,10 @@ const ALLOWLIST: &[Rule] = &[
         alternatives: &[&[(0, Value::Is(2))]],
     },
     // Memory: musl's allocator maps, unmaps, grows (realloc), frees pages
-    // (madvise) and moves the break. Never executable, never at a fixed
-    // address over another mapping, no other advice. No mprotect at all:
-    // after lockdown nothing changes a mapping's permissions.
+    // (madvise) and moves the break. Never executable (mmap may still ask
+    // for a fixed address; only mremap is barred from one), no other advice.
+    // No mprotect at all: after lockdown nothing changes a mapping's
+    // permissions.
     Rule::Clear {
         nr: libc::SYS_mmap,
         arg: 2,
@@ -483,6 +481,7 @@ macro_rules! layers {
 layers!(
     Rlimits,
     AddressSpace,
+    Capabilities,
     NonDumpable,
     NoNewPrivs,
     Landlock,
@@ -494,6 +493,7 @@ impl fmt::Display for Layer {
         f.write_str(match self {
             Layer::Rlimits => "rlimits",
             Layer::AddressSpace => "address-space limit",
+            Layer::Capabilities => "capability drop",
             Layer::NonDumpable => "non-dumpable",
             Layer::NoNewPrivs => "no-new-privs",
             Layer::Landlock => "landlock",
@@ -609,8 +609,9 @@ fn address_space_limit(statm: &str, page_size: u64) -> Option<u64> {
 
 /// The descriptor cap (RLIMIT_NOFILE) for a process whose steady state
 /// keeps the descriptors `open`: the number just above the highest of them
-/// stays free, for the netlink socket each rescan opens and closes, and
-/// nothing past it. The highest counts as at least 2, stderr, which logging
+/// stays free, for the Landlock ruleset that `lock` creates (and closes)
+/// after setting this cap, and nothing past it. The steady state opens no
+/// descriptor at all. The highest counts as at least 2, stderr, which logging
 /// writes to and which is open whether or not `open` lists it. The one
 /// place this floor is applied; negative entries are ignored.
 fn open_files_limit(open: impl IntoIterator<Item = RawFd>) -> u64 {
@@ -622,9 +623,63 @@ fn open_files_limit(open: impl IntoIterator<Item = RawFd>) -> u64 {
     highest + 2
 }
 
+/// Whether a failed drop from the bounding set still leaves the capability
+/// layer applied. Dropping needs CAP_SETPCAP: a process without it in its
+/// effective set gets EPERM, and could not have used any capability to
+/// begin with, since its permitted set is emptied too. With no-new-privs
+/// and no exec, the bounding set only matters for regaining capabilities,
+/// which nothing can do then. Any other failure, or EPERM despite
+/// CAP_SETPCAP, is a real one.
+fn bounding_drop_refusal_is_harmless(e: &io::Error, had_setpcap: bool) -> bool {
+    !had_setpcap && e.raw_os_error() == Some(EPERM)
+}
+
+/// Linux's EPERM, spelled out because `libc` is a Linux-only dependency and
+/// the tests of `bounding_drop_refusal_is_harmless` run everywhere.
+const EPERM: i32 = 1;
+
+/// The most capabilities the bounding set can hold: two 32-bit halves.
+#[cfg(target_os = "linux")]
+const MAX_CAPABILITIES: u32 = 64;
+
+/// Empties every capability set: the bounding set (as far as permitted,
+/// see `bounding_drop_refusal_is_harmless`), then the ambient set, then the
+/// effective, permitted and inheritable sets. The bounding set goes first,
+/// while CAP_SETPCAP is still effective. A process that is not root but was
+/// started with capabilities (systemd's `AmbientCapabilities=`, or a binary
+/// given file capabilities) would otherwise keep them: CAP_NET_ADMIN, say,
+/// would let the netlink socket kept for rescans change addresses and
+/// routes.
+#[cfg(target_os = "linux")]
+fn drop_capabilities() -> io::Result<()> {
+    use crate::sys;
+
+    let had_setpcap = sys::effective_capabilities()? & (1 << sys::CAP_SETPCAP) != 0;
+    // Every capability up to the kernel's last, which reading answers
+    // EINVAL past: no file to read, so /proc need not be mounted.
+    for cap in 0..MAX_CAPABILITIES {
+        match sys::in_bounding_set(cap) {
+            Ok(false) => {}
+            Ok(true) => match sys::drop_from_bounding_set(cap) {
+                Err(e) if !bounding_drop_refusal_is_harmless(&e, had_setpcap) => return Err(e),
+                _ => {}
+            },
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    sys::clear_ambient_capabilities()?;
+    sys::clear_capabilities()
+}
+
 /// Sheds everything the steady state does not need, in an order where each
-/// step is still permitted by the ones before: rlimits, non-dumpable,
-/// no-new-privs, Landlock, then seccomp, which forbids the Landlock calls.
+/// step is still permitted by the ones before: rlimits, capabilities,
+/// non-dumpable, no-new-privs, Landlock, then seccomp, which forbids the
+/// capability and Landlock calls. Capabilities go before non-dumpable: the
+/// kernel resets dumpability on some credential changes (not on a pure
+/// drop, but this way non-dumpable is set on the final credentials
+/// whatever the rule). Landlock and seccomp need no capability once
+/// no-new-privs is set, so they lose nothing by coming after.
 /// `open` lists the descriptors the steady state keeps; see
 /// `open_files_limit` for the cap it sets on new ones.
 #[cfg(target_os = "linux")]
@@ -657,6 +712,7 @@ pub fn lock_with(open: impl IntoIterator<Item = RawFd>, statm: io::Result<String
         })
         .and_then(|space| sys::set_limit(Limit::AddressSpace, space));
     report.note(Layer::AddressSpace, space.map(|()| None));
+    report.note(Layer::Capabilities, drop_capabilities().map(|()| None));
     report.note(Layer::NonDumpable, sys::set_not_dumpable().map(|()| None));
     report.note(Layer::NoNewPrivs, sys::set_no_new_privs().map(|()| None));
     let landlock = sys::landlock_abi().and_then(|abi| {
@@ -869,11 +925,14 @@ mod tests {
         for nr in [libc::SYS_poll, libc::SYS_select] {
             assert_eq!(call(nr, [0; 6]), RET_KILL_PROCESS, "syscall {nr}");
         }
-        assert_eq!(call(libc::SYS_socket, netlink), RET_ALLOW);
-        assert_eq!(
-            call(libc::SYS_socket, [libc::AF_INET as u64, 2, 0, 0, 0, 0]),
-            RET_KILL_PROCESS
-        );
+        // No new sockets of any kind, netlink included: the rescans reuse
+        // one opened before lockdown.
+        for args in [netlink, [libc::AF_INET as u64, 2, 0, 0, 0, 0]] {
+            assert_eq!(call(libc::SYS_socket, args), RET_KILL_PROCESS, "{args:?}");
+        }
+        for nr in [libc::SYS_socketpair, libc::SYS_bind, libc::SYS_getsockname] {
+            assert_eq!(call(nr, [0; 6]), RET_KILL_PROCESS, "syscall {nr}");
+        }
         assert_eq!(call(libc::SYS_write, [2, 0, 0, 0, 0, 0]), RET_ALLOW);
         assert_eq!(call(libc::SYS_write, [1, 0, 0, 0, 0, 0]), RET_KILL_PROCESS);
         let exec = [0, 4096, (libc::PROT_READ | libc::PROT_EXEC) as u64, 0, 0, 0];
@@ -1039,8 +1098,8 @@ mod tests {
         assert_eq!(
             report.lines(),
             [
-                "sandbox: rlimits, address-space limit, non-dumpable, no-new-privs, \
-                 landlock ABI 4, seccomp",
+                "sandbox: rlimits, address-space limit, capability drop, non-dumpable, \
+                 no-new-privs, landlock ABI 4, seccomp",
                 "sandbox: address-space limit unavailable (unparsable /proc/self/statm)",
             ]
         );
@@ -1049,6 +1108,45 @@ mod tests {
             lock([]).lines(),
             ["sandbox: none", "sandbox: unavailable on this platform"]
         );
+    }
+
+    /// A failed capability drop is a missing layer like any other, so
+    /// `--require-sandbox` refuses to run without it.
+    #[test]
+    fn a_failed_capability_drop_is_reported_missing() {
+        let report = Report {
+            applied: vec![Applied {
+                layer: Layer::Rlimits,
+                abi: None,
+            }],
+            missing: vec![Missing::Layer(
+                Layer::Capabilities,
+                io::Error::from_raw_os_error(EPERM),
+            )],
+        };
+        assert!(!report.complete());
+        assert!(!report.applied(Layer::Capabilities));
+        assert!(report.missing(Layer::Capabilities).is_some());
+        assert!(
+            report.lines()[1].starts_with("sandbox: capability drop unavailable ("),
+            "{:?}",
+            report.lines()
+        );
+        // Applied before non-dumpable, after the limits.
+        let at = |layer| Layer::ALL.iter().position(|&l| l == layer);
+        assert!(at(Layer::AddressSpace) < at(Layer::Capabilities));
+        assert!(at(Layer::Capabilities) < at(Layer::NonDumpable));
+    }
+
+    #[test]
+    fn only_eperm_without_setpcap_spares_the_bounding_set() {
+        let eperm = io::Error::from_raw_os_error(EPERM);
+        // Linux's EINVAL.
+        let einval = io::Error::from_raw_os_error(22);
+        assert!(bounding_drop_refusal_is_harmless(&eperm, false));
+        assert!(!bounding_drop_refusal_is_harmless(&eperm, true));
+        assert!(!bounding_drop_refusal_is_harmless(&einval, false));
+        assert!(!bounding_drop_refusal_is_harmless(&einval, true));
     }
 
     #[test]

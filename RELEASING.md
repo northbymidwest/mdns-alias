@@ -12,7 +12,10 @@ publishing; what is left to a person is the part that needs judgement.
    notes; it refuses to run if the section is missing or empty, and also if
    anything is still left under `Unreleased`. Do not leave an empty
    `Unreleased` behind: the next change adds it back.
-3. Commit, push, and **wait for CI to finish**. The workflow checks that CI is
+3. Bump the version in `README.md` to match: the current-release line, the
+   `gh attestation verify` command and the compose `image:` line each name
+   it (`0.5.2` at the time of writing). Do it in the release commit.
+4. Commit, push, and **wait for CI to finish**. The workflow checks that CI is
    green on the exact commit; dispatching before it completes is refused.
 
 ## Then

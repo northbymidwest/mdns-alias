@@ -192,6 +192,27 @@ pub fn thread_id() -> libc::pid_t {
     unsafe { libc::gettid() }
 }
 
+/// This machine's host name: the kernel's nodename, from uname. An error
+/// if uname fails or the name is not UTF-8. Only before lockdown: the
+/// seccomp filter does not allow uname.
+pub fn host_name() -> io::Result<String> {
+    // SAFETY: utsname holds only byte arrays, for which all zeros is a
+    // valid value.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: uname writes only into the utsname it is given, which is
+    // valid and writable for its whole size.
+    check(unsafe { libc::uname(&mut uts) })?;
+    // nodename is NUL-terminated within the array; c_char is i8 or u8 by
+    // architecture, and either way its byte is taken as is.
+    let bytes: Vec<u8> = uts
+        .nodename
+        .iter()
+        .map(|c| c.to_ne_bytes()[0])
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
 /// The size of a memory page, in bytes. An error if sysconf reports none:
 /// -1, which it returns on failure (not always setting errno), or 0.
 pub fn page_size() -> io::Result<u64> {
@@ -334,4 +355,166 @@ pub fn netlink_subscribe(fd: BorrowedFd<'_>, group: u32) -> io::Result<()> {
         )
     })
     .map(drop)
+}
+
+/// The port id netlink socket `fd` is bound to, from getsockname: the
+/// `nlmsg_pid` the kernel puts on its replies to this socket. 0 if the
+/// socket is unbound.
+pub fn netlink_port(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    // SAFETY: an all-zero sockaddr_nl is valid.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    let mut len = socklen::<libc::sockaddr_nl>()?;
+    // SAFETY: getsockname writes at most `len`, size_of::<sockaddr_nl>(),
+    // bytes into a live local of exactly that size, and updates `len`, also
+    // a live local.
+    check(unsafe { libc::getsockname(fd.as_raw_fd(), (&raw mut addr).cast(), &raw mut len) })?;
+    Ok(addr.nl_pid)
+}
+
+/// One receive on socket `fd` into `buf` that never blocks, whatever the
+/// socket's mode or receive timeout: WouldBlock if nothing is waiting.
+/// Returns how many bytes it put in `buf`. musl's recv is the recvfrom
+/// system call, which the seccomp filter allows.
+pub fn recv_nowait(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: recv writes at most `buf.len()` bytes into `buf`, which is
+    // live and exclusively borrowed for the call.
+    let n = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    // recv returns -1 on error, which no usize matches.
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
+/// CAP_SETPCAP, which dropping from the bounding set needs.
+pub const CAP_SETPCAP: u32 = 8;
+
+/// `_LINUX_CAPABILITY_VERSION_3`: 64-bit sets, as two 32-bit halves.
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `struct __user_cap_header_struct`.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// `struct __user_cap_data_struct`: one 32-bit half of each set.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// The two halves of one capability set as a 64-bit mask.
+fn joined(low: u32, high: u32) -> u64 {
+    u64::from(high) << 32 | u64::from(low)
+}
+
+/// This thread's effective capability set, as a mask with bit `n` for
+/// capability `n`.
+pub fn effective_capabilities() -> io::Result<u64> {
+    let header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: capget reads the live header and, for version 3, writes
+    // exactly two CapData entries, which `data` holds. The kernel writes
+    // the header back only to report its own version when given one it
+    // does not support; version 3 is supported (Linux 2.6.26 on), so the
+    // header behind the const pointer is only read.
+    let ret = unsafe {
+        raw_syscall(
+            libc::SYS_capget,
+            [word(&raw const header), word(data.as_mut_ptr()), 0, 0, 0, 0],
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(joined(data[0].effective, data[1].effective))
+}
+
+/// Empties this thread's effective, permitted and inheritable capability
+/// sets. Lowering them needs no capability, so this does not fail for want
+/// of one, though a security module may still deny capset, which the
+/// sandbox reports as a missing layer. Nothing short of an exec of a
+/// privileged file could raise them again, which no-new-privs and seccomp
+/// both rule out.
+pub fn clear_capabilities() -> io::Result<()> {
+    let header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    // Both 32-bit halves of every set: zero.
+    let data = [CapData::default(); 2];
+    // SAFETY: capset reads the live header and, for version 3, exactly two
+    // CapData entries, which `data` holds. As with capget, the header is
+    // written back only for an unsupported version, which version 3 is
+    // not, so it is only read through the const pointer.
+    let ret = unsafe {
+        raw_syscall(
+            libc::SYS_capset,
+            [word(&raw const header), word(data.as_ptr()), 0, 0, 0, 0],
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Empties the ambient capability set. Needs no capability.
+pub fn clear_ambient_capabilities() -> io::Result<()> {
+    let clear_all = libc::c_ulong::from(libc::PR_CAP_AMBIENT_CLEAR_ALL.unsigned_abs());
+    // SAFETY: prctl with integer arguments only.
+    check(unsafe { libc::prctl(libc::PR_CAP_AMBIENT, clear_all, ZERO, ZERO, ZERO) }).map(drop)
+}
+
+/// Whether capability `cap` is in the bounding set. `InvalidInput` (EINVAL)
+/// past the kernel's last capability.
+pub fn in_bounding_set(cap: u32) -> io::Result<bool> {
+    // SAFETY: prctl with integer arguments only.
+    check(unsafe {
+        libc::prctl(
+            libc::PR_CAPBSET_READ,
+            libc::c_ulong::from(cap),
+            ZERO,
+            ZERO,
+            ZERO,
+        )
+    })
+    .map(|held| held == 1)
+}
+
+/// Removes capability `cap` from the bounding set. Needs CAP_SETPCAP in the
+/// effective set; EPERM without it.
+pub fn drop_from_bounding_set(cap: u32) -> io::Result<()> {
+    // SAFETY: prctl with integer arguments only.
+    check(unsafe {
+        libc::prctl(
+            libc::PR_CAPBSET_DROP,
+            libc::c_ulong::from(cap),
+            ZERO,
+            ZERO,
+            ZERO,
+        )
+    })
+    .map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn host_name_reads_the_kernels_name() {
+        let name = super::host_name().unwrap();
+        assert!(!name.is_empty() && !name.contains('\0'), "{name:?}");
+    }
 }

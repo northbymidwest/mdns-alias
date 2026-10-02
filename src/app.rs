@@ -4,24 +4,25 @@
 use std::error::Error;
 use std::hash::{BuildHasher, RandomState};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::cli;
 use crate::net::IfIndex;
 use crate::net::{Backoff, FailureLog, Net, Readiness, Receive, Rescan, Settle};
-use crate::responder::{Conflict, Family, Mode, Notice, Responder, Step};
+use crate::responder::{Dest, Family, MDNS_PORT, Notice, Outgoing, Responder, Source, Step};
 use crate::sandbox;
 use crate::signals::Signals;
 
-/// The kernel host name on Linux, where this is deployed. Elsewhere the
-/// read fails and `--host` is required.
-const HOSTNAME_FILE: &str = "/proc/sys/kernel/hostname";
 /// Milliseconds between safety rescans when change notifications arrive.
 const SAFETY_RESCAN: u64 = 300_000;
 /// Milliseconds between rescans without notifications (macOS, or a host
 /// that refused the subscription).
 const POLL_RESCAN: u64 = 30_000;
+/// Milliseconds before rescanning again after a listing that was
+/// interrupted, timed out or was refused as busy (`netlink::retry_soon`);
+/// doubled for each further consecutive retry, up to the usual interval.
+const RETRY_RESCAN: u64 = 2_000;
 /// Largest mDNS message (RFC 6762 section 17).
 const MAX_MESSAGE: usize = 9000;
 /// Most packets read from one socket per pass of the loop, so a busy socket
@@ -29,26 +30,40 @@ const MAX_MESSAGE: usize = 9000;
 const READ_BURST: usize = 32;
 /// The families, in the order `Net::wait` reports on them.
 const FAMILIES: [Family; 2] = [Family::V4, Family::V6];
+/// `ENOBUFS`: no room in the device queue or the socket's buffers for this
+/// packet, which is lost, but the link is fine.
+#[cfg(target_os = "linux")]
+const ENOBUFS: i32 = libc::ENOBUFS;
+/// `ENOBUFS` on macOS and the BSDs, the development platforms.
+#[cfg(not(target_os = "linux"))]
+const ENOBUFS: i32 = 55;
 
 /// Runs the responder until SIGINT or SIGTERM. An error is fatal: bad
-/// arguments, no usable socket, an unmet `--require-sandbox`, or a name
-/// conflict.
+/// arguments, no usable socket, an unmet `--require-sandbox`, or a failed
+/// wait. A name conflict is not: the responder probes the name again, and
+/// stops serving it where another host holds it until a later retry.
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = cli::parse(std::env::args().skip(1))?;
     #[cfg(target_os = "linux")]
     if crate::sys::is_root() {
         return Err("refusing to run as root; run as an unprivileged user".into());
     }
-    let hostname = std::fs::read_to_string(HOSTNAME_FILE).ok();
-    let (target, aliases) = cli::resolve(&cli, hostname.as_deref())?;
+    // Before lockdown, which forbids uname. Elsewhere than Linux there is
+    // no wrapper for it, and the check is skipped.
+    #[cfg(target_os = "linux")]
+    let host_name = crate::sys::host_name()
+        .inspect_err(|e| {
+            eprintln!(
+                "mdns-alias: cannot read the host name ({e}); not checking aliases against it"
+            );
+        })
+        .ok();
+    #[cfg(not(target_os = "linux"))]
+    let host_name: Option<String> = None;
+    cli::check_own_name(&cli.aliases, host_name.as_deref())?;
     // Only for probe jitter, so a hash of the pid with a random key is plenty.
     let seed = RandomState::new().hash_one(std::process::id());
-    let mode = if cli.cname {
-        Mode::Cname(target.clone())
-    } else {
-        Mode::Addresses
-    };
-    let mut responder = Responder::new(aliases.clone(), mode.clone(), seed);
+    let mut responder = Responder::new(cli.aliases.clone(), seed);
     let signals = Signals::new()?;
     let mut net = Net::open(cli.interfaces)?;
     log_net(&mut net);
@@ -61,11 +76,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if cli.require_sandbox && !report.complete() {
         return Err("--require-sandbox: not every sandbox layer could be applied".into());
     }
-    for alias in &aliases {
-        match &mode {
-            Mode::Cname(host) => eprintln!("mdns-alias: publishing {alias} -> {host}"),
-            Mode::Addresses => eprintln!("mdns-alias: publishing {alias}"),
-        }
+    for alias in &cli.aliases {
+        eprintln!("mdns-alias: publishing {alias}");
     }
 
     let start = Instant::now();
@@ -81,6 +93,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut health: [Health; 2] = Default::default();
     // Nothing to read before the first wait.
     let mut ready = [Readiness::Unwatched; 2];
+    let mut retries = 0u32;
+    let mut relink = Relink::default();
     while !signals.pending() {
         let drained = net.drain_events(now());
         if drained.overflow {
@@ -90,8 +104,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
         if settle.due(now()) || now() >= next_rescan {
             settle.clear();
-            rescan(&mut net, &mut responder, now());
-            next_rescan = now() + interval;
+            let retry = rescan(&mut net, &mut responder, now());
+            retries = if retry { retries.saturating_add(1) } else { 0 };
+            next_rescan = now() + rescan_delay(retry, retries, interval);
         }
         for ((family, health), readiness) in FAMILIES.into_iter().zip(&mut health).zip(ready) {
             match readiness {
@@ -108,12 +123,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         faulty,
                         &mut buf,
                         &now,
-                    )?;
+                    );
                 }
             }
         }
         let step = responder.poll(now());
         dispatch(&mut net, &mut responder, step, now());
+        // A link dropped for a failed send, by any dispatch above, comes
+        // back with the next rescan: soon, should the failure be brief.
+        if net.take_dropped() {
+            let at = now();
+            next_rescan = next_rescan.min(at + relink.dropped(at, interval));
+        }
 
         // Sleep until a descriptor wakes us or the next timer is due.
         let at = now();
@@ -151,6 +172,38 @@ fn timeout(now: u64, rescan: u64, others: impl IntoIterator<Item = Option<u64>>)
         .flatten()
         .fold(rescan, u64::min)
         .saturating_sub(now)
+}
+
+/// When to rescan after a link was dropped for a failed send, so that it is
+/// joined again: `RETRY_RESCAN` after the drop, doubled for each further
+/// drop, up to the usual interval, so a link that keeps failing is not
+/// rejoined and dropped every few seconds. The doubling starts over only
+/// once a rejoined link has gone a whole interval without a drop.
+#[derive(Debug, Default)]
+struct Relink {
+    /// While links keep failing: when the last drop was, how many have
+    /// followed each other so far, and the delay that drop was given.
+    run: Option<(u64, u32, u64)>,
+}
+
+impl Relink {
+    /// A link was dropped at `now`: how long until the rescan that rejoins
+    /// it, never more than `interval`.
+    fn dropped(&mut self, now: u64, interval: u64) -> u64 {
+        let count = match self.run {
+            // Rejoined `delay` after the last drop at the earliest; lasting
+            // an interval from then would have ended the run.
+            Some((last, count, delay))
+                if now.saturating_sub(last) < delay.saturating_add(interval) =>
+            {
+                count.saturating_add(1)
+            }
+            _ => 1,
+        };
+        let delay = rescan_delay(true, count, interval);
+        self.run = Some((now, count, delay));
+        delay
+    }
 }
 
 /// One family's socket health: its failure log, and its rest after a
@@ -198,7 +251,7 @@ fn receive(
     faulty: bool,
     buf: &mut [u8],
     now: &impl Fn() -> u64,
-) -> Result<(), Conflict> {
+) {
     for read in 0..READ_BURST {
         let received = match net.recv(family, buf) {
             Ok(Receive::Empty) if faulty && read == 0 => {
@@ -212,10 +265,12 @@ fn receive(
                 health.recovered(family);
                 match got {
                     Receive::Packet(got) => {
-                        // A conflict ends the program: the name is someone
-                        // else's.
-                        let step =
-                            responder.handle(&buf[..got.len], got.link, got.source, now())?;
+                        let source = Source {
+                            addr: got.source,
+                            unicast: got.unicast,
+                            direct: got.direct,
+                        };
+                        let step = responder.handle(&buf[..got.len], got.link, source, now());
                         dispatch(net, responder, step, now());
                     }
                     Receive::Ignored => {}
@@ -228,7 +283,6 @@ fn receive(
             }
         }
     }
-    Ok(())
 }
 
 /// ` (3 more failures not logged)` for `skipped` 3 and `noun` "failure",
@@ -251,20 +305,31 @@ fn log_net(net: &mut Net) {
     }
 }
 
-fn rescan(net: &mut Net, responder: &mut Responder, now: u64) {
-    let scan = net.rescan();
+/// How long until the next rescan: after a listing worth retrying soon
+/// (`retries` is the number of those in a row, this one included),
+/// `RETRY_RESCAN` doubled for each one before it, else `interval`; never
+/// more than `interval`.
+fn rescan_delay(retry_soon: bool, retries: u32, interval: u64) -> u64 {
+    if retry_soon {
+        let doublings = retries.saturating_sub(1).min(32);
+        (RETRY_RESCAN << doublings).min(interval)
+    } else {
+        interval
+    }
+}
+
+/// Rescans and applies the result; whether the listing was interrupted,
+/// timed out or refused as busy and should be repeated soon.
+fn rescan(net: &mut Net, responder: &mut Responder, now: u64) -> bool {
+    let scan = net.rescan(now);
+    let retry_soon = scan.retry_soon;
     log_net(net);
     for change in apply(scan, responder, now) {
         if let Some(name) = net.interface_name(change.index) {
             let list = if change.addrs.is_empty() {
                 "none stable".to_string()
             } else {
-                change
-                    .addrs
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                join(&change.addrs)
             };
             eprintln!("mdns-alias: addresses on {name}: {list}");
         }
@@ -273,6 +338,21 @@ fn rescan(net: &mut Net, responder: &mut Responder, now: u64) {
     if net.is_empty() {
         eprintln!("mdns-alias: no usable interfaces yet");
     }
+    retry_soon
+}
+
+/// `ms` milliseconds as whole minutes, at least one, for a log line.
+fn minutes(ms: u64) -> String {
+    format!("{} min", (ms / 60_000).max(1))
+}
+
+/// `items` in order, separated by commas, for a log line.
+fn join<T: ToString>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One interface's address change as `apply` made it: the new set as the
@@ -320,9 +400,33 @@ fn apply(scan: Rescan, responder: &mut Responder, now: u64) -> Vec<Change> {
 fn dispatch(net: &mut Net, responder: &mut Responder, step: Step, now: u64) {
     for notice in step.notices {
         match notice {
-            Notice::Announced(link) => eprintln!("mdns-alias: announced on {}", net.describe(link)),
-            Notice::TiebreakLost(link) => eprintln!(
-                "mdns-alias: another host is probing for the same name on {}, probing again",
+            Notice::Announced(link, aliases) => eprintln!(
+                "mdns-alias: announced {} on {}",
+                join(&aliases),
+                net.describe(link)
+            ),
+            Notice::TiebreakLost(link, alias) => eprintln!(
+                "mdns-alias: another host is probing for {alias} on {}, probing again",
+                net.describe(link)
+            ),
+            Notice::HeldBack(link, alias) => eprintln!(
+                "mdns-alias: {alias} on {}: probing held back by other hosts' probes",
+                net.describe(link)
+            ),
+            Notice::Conflict(conflict) => {
+                eprintln!("mdns-alias: {conflict}; probing again");
+            }
+            Notice::Lost {
+                link,
+                conflict,
+                retry,
+            } => eprintln!(
+                "mdns-alias: {conflict} on {}; giving up on it there for now, retrying in {}",
+                net.describe(link),
+                minutes(retry)
+            ),
+            Notice::Retry(link, alias) => eprintln!(
+                "mdns-alias: probing for {alias} on {} again",
                 net.describe(link)
             ),
             Notice::Oversized(link, alias) => eprintln!(
@@ -332,49 +436,140 @@ fn dispatch(net: &mut Net, responder: &mut Responder, step: Step, now: u64) {
         }
     }
     for out in step.sends {
-        // An earlier send in this step may have failed and dropped the link.
-        if !net.serves(out.link) {
-            continue;
-        }
-        match net.send(&out) {
-            Ok(()) => {}
-            // The socket does not wait for room in its send buffer: this
-            // packet is lost, but the link is fine.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(skipped) = net.send_dropped(out.link.family, now) {
-                    eprintln!(
-                        "mdns-alias: send buffer full on {}, dropped a packet{}; \
-                         logging again at most once a minute",
-                        net.describe(out.link),
-                        not_logged(skipped, "")
-                    );
-                }
-            }
-            Err(e) if out.failure_breaks_link() => {
+        send(net, responder, out, now);
+    }
+}
+
+/// Sends one packet, and deals with its failure: see `SendFailure`.
+fn send(net: &mut Net, responder: &mut Responder, out: Outgoing, now: u64) {
+    send_with(net, responder, out, now, &mut |net, out| net.send(out));
+}
+
+/// `send`, sending with `transmit`, which tests replace.
+fn send_with(
+    net: &mut Net,
+    responder: &mut Responder,
+    out: Outgoing,
+    now: u64,
+    transmit: &mut impl FnMut(&Net, &Outgoing) -> io::Result<()>,
+) {
+    // An earlier send in this step may have failed and dropped the link.
+    if !net.serves(out.link) {
+        return;
+    }
+    let Err(e) = transmit(net, &out) else {
+        return;
+    };
+    match failure(&out, &e) {
+        SendFailure::Dropped => {
+            if let Some(skipped) = net.send_dropped(out.link.family, now) {
+                let reason = if e.kind() == io::ErrorKind::WouldBlock {
+                    "send buffer full".to_string()
+                } else {
+                    e.to_string()
+                };
                 eprintln!(
-                    "mdns-alias: sending on {} failed, dropping it until the next rescan: {e}",
-                    net.describe(out.link)
+                    "mdns-alias: dropped a packet on {} ({reason}){}; \
+                     logging again at most once a minute",
+                    net.describe(out.link),
+                    not_logged(skipped, "")
                 );
-                net.leave(out.link);
-                responder.remove_link(out.link);
             }
-            Err(e) => eprintln!(
-                "mdns-alias: reply to {:?} on {} failed: {e}",
-                out.dest,
-                net.describe(out.link)
-            ),
         }
+        SendFailure::LinkBroken => {
+            eprintln!(
+                "mdns-alias: sending on {} failed, dropping it until a rescan rejoins it: {e}",
+                net.describe(out.link)
+            );
+            net.drop_link(out.link);
+            responder.remove_link(out.link);
+        }
+        SendFailure::Unreachable(addr) => {
+            log_reply_failure(net, &out, addr, &e, "; answering by multicast instead", now);
+            for out in responder.unicast_failed(&out, now) {
+                send_with(net, responder, out, now, transmit);
+            }
+        }
+        SendFailure::ReplyFailed(addr) => log_reply_failure(net, &out, addr, &e, "", now),
+    }
+}
+
+/// Logs a failed unicast reply to `addr`, rate-limited per family: anyone
+/// on the link can make replies fail, so each must not cost a line.
+fn log_reply_failure(
+    net: &mut Net,
+    out: &Outgoing,
+    addr: SocketAddr,
+    e: &io::Error,
+    then: &str,
+    now: u64,
+) {
+    if let Some(skipped) = net.reply_failed(out.link.family, now) {
+        eprintln!(
+            "mdns-alias: reply to {addr} on {} failed: {e}{then}{}; \
+             logging again at most once a minute",
+            net.describe(out.link),
+            not_logged(skipped, "")
+        );
+    }
+}
+
+/// What a failed send means.
+#[derive(Debug, PartialEq, Eq)]
+enum SendFailure {
+    /// No room for the packet just now (the socket does not wait for it):
+    /// it is lost, but the link is fine.
+    Dropped,
+    /// The link cannot send multicast: stop serving it until a rescan
+    /// joins it again.
+    LinkBroken,
+    /// A unicast reply to a querier on port 5353 found no route (or no
+    /// source address) for it: the responder answers by multicast instead
+    /// (`Responder::unicast_failed`), which the querier hears as well as
+    /// any (RFC 6762 section 11), under the multicast rate limit. A legacy
+    /// querier cannot hear multicast, so never gets here.
+    Unreachable(SocketAddr),
+    /// Any other failed unicast reply. Its reasons may be the querier's
+    /// own, which must not cost everyone else on the link their answers.
+    ReplyFailed(SocketAddr),
+}
+
+/// What sending `out` failing with `e` means.
+fn failure(out: &Outgoing, e: &io::Error) -> SendFailure {
+    let no_room = matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
+    ) || e.raw_os_error() == Some(ENOBUFS);
+    let unreachable = matches!(
+        e.kind(),
+        io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::AddrNotAvailable
+    );
+    match out.dest {
+        _ if no_room => SendFailure::Dropped,
+        Dest::Multicast => SendFailure::LinkBroken,
+        // A legacy querier, on another port, cannot hear multicast.
+        Dest::Unicast(addr) if unreachable && addr.port() == MDNS_PORT => {
+            SendFailure::Unreachable(addr)
+        }
+        Dest::Unicast(addr) => SendFailure::ReplyFailed(addr),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, not_logged, timeout};
+    use super::{
+        ENOBUFS, RETRY_RESCAN, Relink, SendFailure, apply, failure, not_logged, rescan_delay,
+        send_with, timeout,
+    };
     use crate::net::IfIndex;
+    use crate::net::Net;
     use crate::net::Rescan;
-    use crate::responder::{Family, Link, Mode, Outgoing, Responder};
+    use crate::responder::{Dest, Family, Link, Outgoing, Responder};
     use crate::wire::{self, Message, Name, RData};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn skipped_counts_read_naturally() {
@@ -383,6 +578,217 @@ mod tests {
         assert_eq!(not_logged(3, "failure"), " (3 more failures not logged)");
         assert_eq!(not_logged(0, ""), "");
         assert_eq!(not_logged(2, ""), " (2 more not logged)");
+    }
+
+    #[test]
+    fn a_failed_listing_is_retried_soon_backing_off_but_not_later_than_usual() {
+        assert_eq!(rescan_delay(false, 0, 300_000), 300_000);
+        assert_eq!(rescan_delay(true, 1, 300_000), RETRY_RESCAN);
+        assert_eq!(rescan_delay(true, 2, 300_000), 2 * RETRY_RESCAN);
+        assert_eq!(rescan_delay(true, 4, 300_000), 8 * RETRY_RESCAN);
+        assert_eq!(rescan_delay(true, 20, 300_000), 300_000);
+        assert_eq!(rescan_delay(true, u32::MAX, 300_000), 300_000);
+        assert_eq!(rescan_delay(true, 1, 1_000), 1_000);
+    }
+
+    #[test]
+    fn a_dropped_link_is_rejoined_soon_backing_off_while_drops_continue() {
+        let mut relink = Relink::default();
+        let interval = 300_000;
+        assert_eq!(relink.dropped(10_000, interval), RETRY_RESCAN);
+        // Dropped again after each rejoin: twice as long each time.
+        assert_eq!(relink.dropped(12_500, interval), 2 * RETRY_RESCAN);
+        assert_eq!(relink.dropped(17_000, interval), 4 * RETRY_RESCAN);
+        // Never later than the usual rescan.
+        let mut at = 17_000;
+        for _ in 0..40 {
+            at += 1_000;
+            assert!(relink.dropped(at, interval) <= interval);
+        }
+        // A link that fails on every rejoin stays at the interval, though
+        // each drop comes over an interval after the one before.
+        for _ in 0..3 {
+            at += interval + 50;
+            assert_eq!(relink.dropped(at, interval), interval);
+        }
+        // A rejoined link that lasts a whole interval starts over.
+        at += 2 * interval;
+        assert_eq!(relink.dropped(at, interval), RETRY_RESCAN);
+        // Rejoined 2 s later, dropped just short of an interval after that:
+        // still the same run.
+        at += RETRY_RESCAN + interval - 1;
+        assert_eq!(relink.dropped(at, interval), 2 * RETRY_RESCAN);
+        at += 2 * RETRY_RESCAN + interval;
+        assert_eq!(relink.dropped(at, interval), RETRY_RESCAN);
+    }
+
+    #[test]
+    fn a_send_without_room_loses_the_packet_but_keeps_the_link() {
+        let multicast = Outgoing {
+            link: V4,
+            dest: Dest::Multicast,
+            packet: Vec::new(),
+            probe: false,
+        };
+        let unicast = Outgoing {
+            dest: Dest::Unicast(QUERIER),
+            ..multicast.clone()
+        };
+        for out in [&multicast, &unicast] {
+            for e in [
+                io::Error::from(io::ErrorKind::WouldBlock),
+                io::Error::from(io::ErrorKind::OutOfMemory),
+                io::Error::from_raw_os_error(ENOBUFS),
+            ] {
+                assert_eq!(failure(out, &e), SendFailure::Dropped, "{e}");
+            }
+        }
+        // Anything else breaks a link that cannot multicast, but a failed
+        // reply is the querier's affair.
+        let e = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(failure(&multicast, &e), SendFailure::LinkBroken);
+        assert_eq!(failure(&unicast, &e), SendFailure::ReplyFailed(QUERIER));
+        let e = io::Error::from(io::ErrorKind::NetworkUnreachable);
+        assert_eq!(failure(&multicast, &e), SendFailure::LinkBroken);
+    }
+
+    const QUERIER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 5353);
+
+    #[test]
+    fn a_reply_with_no_route_goes_by_multicast_unless_legacy() {
+        let auto = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 10, 20)), 5353);
+        let reply = Outgoing {
+            link: V4,
+            dest: Dest::Unicast(auto),
+            packet: Vec::new(),
+            probe: false,
+        };
+        for kind in [
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::AddrNotAvailable,
+        ] {
+            let e = io::Error::from(kind);
+            assert_eq!(failure(&reply, &e), SendFailure::Unreachable(auto));
+            // A legacy querier cannot hear multicast: nothing to fall back to.
+            let legacy = SocketAddr::new(auto.ip(), 54928);
+            let out = Outgoing {
+                dest: Dest::Unicast(legacy),
+                ..reply.clone()
+            };
+            assert_eq!(failure(&out, &e), SendFailure::ReplyFailed(legacy));
+        }
+        // Other failures are not about the route.
+        let e = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(failure(&reply, &e), SendFailure::ReplyFailed(auto));
+    }
+
+    /// A served responder and net on V4, and the unicast reply to a QU
+    /// question from `querier`, asked at 7000.
+    fn failing_reply(querier: SocketAddr) -> (Responder, Net, Outgoing) {
+        let mut r = serving(&["192.0.2.10"]);
+        let q = Message {
+            questions: vec![wire::Question {
+                name: Name::parse("app.myhost.local").unwrap(),
+                qtype: wire::RType::A,
+                qclass: wire::Class::IN,
+                unicast_response: true,
+            }],
+            ..Message::default()
+        };
+        let mut sent = r.handle(&wire::encode(&q), V4, querier, 7000).sends;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let reply = sent.remove(0);
+        assert_eq!(reply.dest, Dest::Unicast(querier));
+        (r, Net::without_sockets(&[V4, V6, OTHER]), reply)
+    }
+
+    /// Sends `out` at `now` with every unicast failing with `unicast` and
+    /// every multicast with `multicast`; the destinations tried, in order.
+    fn try_send(
+        r: &mut Responder,
+        net: &mut Net,
+        out: &Outgoing,
+        now: u64,
+        unicast: io::ErrorKind,
+        multicast: io::ErrorKind,
+    ) -> Vec<Dest> {
+        let mut tried = Vec::new();
+        send_with(net, r, out.clone(), now, &mut |_, out: &Outgoing| {
+            tried.push(out.dest);
+            Err(match out.dest {
+                Dest::Unicast(_) => unicast,
+                Dest::Multicast => multicast,
+            }
+            .into())
+        });
+        tried
+    }
+
+    const AUTO: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 10, 20)), 5353);
+
+    #[test]
+    fn a_reply_without_a_route_falls_back_to_a_rate_limited_multicast() {
+        use io::ErrorKind::{NetworkUnreachable, WouldBlock};
+        let (mut r, mut net, reply) = failing_reply(AUTO);
+        let tried = try_send(
+            &mut r,
+            &mut net,
+            &reply,
+            7000,
+            NetworkUnreachable,
+            WouldBlock,
+        );
+        assert_eq!(tried, [Dest::Unicast(AUTO), Dest::Multicast]);
+        // The multicast found no room: the packet is lost, the link kept.
+        assert!(net.serves(V4) && !net.take_dropped());
+        // Both failures were logged, so the next ones within a minute are
+        // not.
+        assert_eq!(net.reply_failed(Family::V4, 7001), None);
+        assert_eq!(net.send_dropped(Family::V4, 7001), None);
+        // Failing again 1 ms later: no second multicast within the second.
+        let tried = try_send(
+            &mut r,
+            &mut net,
+            &reply,
+            7001,
+            NetworkUnreachable,
+            WouldBlock,
+        );
+        assert_eq!(tried, [Dest::Unicast(AUTO)]);
+        // A legacy querier cannot hear multicast: nothing to fall back to.
+        let legacy = SocketAddr::new(AUTO.ip(), 54928);
+        let (mut r, mut net, reply) = failing_reply(legacy);
+        let tried = try_send(
+            &mut r,
+            &mut net,
+            &reply,
+            7000,
+            NetworkUnreachable,
+            WouldBlock,
+        );
+        assert_eq!(tried, [Dest::Unicast(legacy)]);
+        assert!(net.serves(V4));
+    }
+
+    #[test]
+    fn a_fallback_multicast_that_fails_drops_the_link() {
+        use io::ErrorKind::{NetworkUnreachable, PermissionDenied};
+        let (mut r, mut net, reply) = failing_reply(AUTO);
+        let tried = try_send(
+            &mut r,
+            &mut net,
+            &reply,
+            7000,
+            NetworkUnreachable,
+            PermissionDenied,
+        );
+        assert_eq!(tried, [Dest::Unicast(AUTO), Dest::Multicast]);
+        assert!(!net.serves(V4) && net.take_dropped());
+        // The responder forgot the link too.
+        assert!(r.unicast_failed(&reply, 9000).is_empty());
+        // Other links carry on.
+        assert!(net.serves(V6) && net.serves(OTHER));
     }
 
     #[test]
@@ -438,7 +844,7 @@ mod tests {
 
     fn responder() -> Responder {
         let alias = Name::parse("app.myhost.local").unwrap();
-        Responder::new(vec![alias], Mode::Addresses, 7)
+        Responder::new(vec![alias], 7)
     }
 
     fn ip(text: &str) -> IpAddr {
@@ -453,6 +859,7 @@ mod tests {
                 .iter()
                 .map(|(index, addrs)| (IfIndex::of(*index), addrs.iter().map(|a| ip(a)).collect()))
                 .collect(),
+            retry_soon: false,
         }
     }
 

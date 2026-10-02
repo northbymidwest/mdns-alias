@@ -66,20 +66,38 @@ pub struct Net {
     unserved: Vec<String>,
     /// Each served interface's stable addresses as of the last rescan.
     addrs: Vec<(IfIndex, Vec<IpAddr>)>,
+    /// The name of each interface wanted as of the last rescan, joined or
+    /// not, so an address change is logged under the interface's name even
+    /// when its join failed.
+    names: Vec<(IfIndex, String)>,
     /// Link and address change notifications, if the host allows them.
     #[cfg(target_os = "linux")]
     events: Option<socket2::Socket>,
+    /// The socket every rescan lists links and addresses over. Always
+    /// present once opened; `None` only in tests that never list.
+    #[cfg(target_os = "linux")]
+    dumper: Option<crate::netlink::Dumper>,
     #[cfg(target_os = "linux")]
     event_buf: Vec<u8>,
     drops: DropLog,
     /// The notification socket's rest after a failed drain.
     events_rest: Backoff,
-    /// Packets dropped for a full send buffer, per family, IPv4 first: the
-    /// first is logged, then at most one line a minute.
+    /// Packets dropped for want of room to send them (a full send buffer,
+    /// ENOBUFS, ENOMEM), per family, IPv4 first: the first is logged, then
+    /// at most one line a minute.
     full: [FailureLog; 2],
+    /// Failed unicast replies, per family, IPv4 first: the first is
+    /// logged, then at most one line a minute.
+    replies: [FailureLog; 2],
+    /// Failed interface listings: the first is logged, then at most one
+    /// line a minute.
+    listing: FailureLog,
     /// Lines to log, from opening, rescans and receives; collected by
     /// `take_log`.
     log: Vec<String>,
+    /// A link was dropped for a failed send since `take_dropped` last
+    /// looked.
+    dropped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,20 +136,30 @@ pub struct Rescan {
     pub removed: Vec<Link>,
     /// Interfaces whose stable addresses changed, with the new sets; empty for interfaces no longer served.
     pub addresses: Vec<(IfIndex, Vec<IpAddr>)>,
+    /// The listing failed in a way worth repeating soon (interrupted by a
+    /// change, timed out, or refused as busy; `netlink::retry_soon`) and
+    /// nothing was applied: rescan again soon instead of after the usual
+    /// interval.
+    pub retry_soon: bool,
 }
 
 pub struct Received {
     pub len: usize,
     pub link: Link,
     pub source: SocketAddr,
+    /// Whether a reply may go to the sender by unicast: false for a sender
+    /// off the link's subnets, accepted only because it sent to the group.
+    pub unicast: bool,
+    /// Whether it was sent straight to us rather than to the mDNS group.
+    pub direct: bool,
 }
 
 /// What one read of a non-blocking socket found.
 pub enum Receive {
     /// A packet for the responder.
     Packet(Received),
-    /// A packet the responder must not see: on a link not served, or from
-    /// off-link. There may be more behind it.
+    /// A packet the responder must not see: on a link not served, or sent
+    /// straight to us from off-link. There may be more behind it.
     Ignored,
     /// Nothing waiting, or no socket for the family.
     Empty,
@@ -193,6 +221,15 @@ impl Net {
                 (v4.ok(), v6.ok())
             }
         };
+        // Without it no rescan could ever list an interface, and it cannot
+        // be opened later, under the sandbox.
+        #[cfg(target_os = "linux")]
+        let dumper = crate::netlink::Dumper::open().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot open the netlink socket for listing interfaces: {e}"),
+            )
+        })?;
         #[cfg(target_os = "linux")]
         let events = match crate::netlink::subscribe() {
             Ok(sock) => Some(sock),
@@ -210,25 +247,71 @@ impl Net {
             joined: BTreeMap::new(),
             unserved: Vec::new(),
             addrs: Vec::new(),
+            names: Vec::new(),
             #[cfg(target_os = "linux")]
             events,
+            #[cfg(target_os = "linux")]
+            dumper: Some(dumper),
             #[cfg(target_os = "linux")]
             event_buf: vec![0; 8192],
             drops: DropLog::default(),
             events_rest: Backoff::default(),
             full: Default::default(),
+            replies: Default::default(),
+            listing: FailureLog::default(),
             log,
+            dropped: false,
         })
     }
 
     /// Brings group membership in line with the interfaces present now,
     /// with what it did for `take_log`.
-    pub fn rescan(&mut self) -> Rescan {
-        match list_interfaces() {
-            Ok(ifs) => self.reconcile(&ifs, &self.families()),
+    pub fn rescan(&mut self, now: u64) -> Rescan {
+        let listing = self.list_interfaces();
+        self.rescan_with(listing, now)
+    }
+
+    /// Every address on every interface, from the kernel over the dump
+    /// socket.
+    #[cfg(target_os = "linux")]
+    fn list_interfaces(&mut self) -> io::Result<Vec<Interface>> {
+        let dumper = self
+            .dumper
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no netlink socket"))?;
+        list_interfaces(dumper)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn list_interfaces(&mut self) -> io::Result<Vec<Interface>> {
+        list_interfaces()
+    }
+
+    /// `rescan` given the listing. A listing that failed leaves everything
+    /// as it was. One that a change interrupted, whose reply did not come,
+    /// or that the kernel refused as busy (see `netlink::retry_soon`) is
+    /// worth trying again soon, so the scan says `retry_soon`.
+    fn rescan_with(&mut self, listing: io::Result<Vec<Interface>>, now: u64) -> Rescan {
+        match listing {
+            Ok(ifs) => {
+                self.listing.recovered();
+                self.reconcile(&ifs, &self.families())
+            }
             Err(e) => {
-                self.log.push(format!("cannot list interfaces: {e}"));
-                Rescan::default()
+                if let Some(skipped) = self.listing.failed(now) {
+                    let more = match skipped {
+                        0 => String::new(),
+                        n => format!(" ({n} more not logged)"),
+                    };
+                    self.log.push(format!("cannot list interfaces: {e}{more}"));
+                }
+                // Signals arrive through a signalfd, so no system call
+                // fails with EINTR: Interrupted can only be an interrupted
+                // dump.
+                Rescan {
+                    retry_soon: crate::netlink::retry_soon(&e),
+                    ..Rescan::default()
+                }
             }
         }
     }
@@ -240,6 +323,7 @@ impl Net {
         let stable = stable_addresses(ifs, &want);
         scan.addresses = address_changes(&self.addrs, &stable);
         self.addrs = stable;
+        self.names = interface_names(&want);
         self.drops.reset();
         while let Some(&link) = self.joined.keys().find(|link| !want.contains_key(link)) {
             self.log.push(format!("left {}", self.describe(link)));
@@ -300,30 +384,32 @@ impl Net {
                     return Ok(Receive::Ignored);
                 };
                 let link = Link { index, family };
-                // Off-link senders (RFC 6762 section 11), and anything on a
-                // link we do not serve, never reach the responder. Off-link
-                // drops on a served link are logged once per rescan: a
-                // netmask that does not cover the LAN should not fail
-                // silently.
-                match verdict(&self.joined, link, info.addr_src.ip()) {
-                    Verdict::Accept => {}
+                // Anything on a link we do not serve never reaches the
+                // responder, nor does a packet sent straight to us from
+                // off-link (RFC 6762 sections 5.5 and 11). Off-link drops on
+                // a served link are logged once per rescan: a netmask that
+                // does not cover the LAN should not fail silently.
+                let source = info.addr_src.ip();
+                let unicast = match verdict(&self.joined, link, source, info.addr_dst) {
+                    Verdict::Accept { unicast } => unicast,
                     Verdict::Unserved => return Ok(Receive::Ignored),
                     Verdict::OffLink => {
                         if self.drops.first(link) {
                             self.log.push(format!(
-                                "ignoring {} on {}: not on its subnets; further ones are \
+                                "ignoring {source} on {}: not on its subnets; further ones are \
                                  ignored silently until the next rescan",
-                                info.addr_src.ip(),
                                 self.describe(link)
                             ));
                         }
                         return Ok(Receive::Ignored);
                     }
-                }
+                };
                 Ok(Receive::Packet(Received {
                     len,
                     link,
                     source: info.addr_src,
+                    unicast,
+                    direct: !to_group(info.addr_dst),
                 }))
             }
             Err(e)
@@ -338,11 +424,20 @@ impl Net {
         }
     }
 
-    /// A packet for `family` was dropped at `now` for a full send buffer.
+    /// A packet for `family` was dropped at `now` for want of room to send
+    /// it.
     /// `Some(n)` means log it, noting the `n` drops skipped since the last
     /// line: the first is logged, then at most one line a minute.
     pub fn send_dropped(&mut self, family: Family, now: u64) -> Option<u64> {
         self.full[slot(family)].failed(now)
+    }
+
+    /// A unicast reply on `family` failed at `now`. `Some(n)` means log it,
+    /// noting the `n` failures skipped since the last line: the first is
+    /// logged, then at most one line a minute. Anyone on the link can make
+    /// replies fail, by asking from an address there is no route to.
+    pub fn reply_failed(&mut self, family: Family, now: u64) -> Option<u64> {
+        self.replies[slot(family)].failed(now)
     }
 
     /// Waits until a socket of a family in `watch` has something to read or
@@ -442,9 +537,65 @@ impl Net {
         Ok(())
     }
 
+    /// A `Net` without sockets, so every send and join fails, that serves
+    /// `links`, each on an interface named `eth<index>`, an IPv4 one keyed
+    /// by 192.0.2.10. For tests of what is done with a failed send.
+    #[cfg(test)]
+    pub fn without_sockets(links: &[Link]) -> Net {
+        let joined = links.iter().map(|&link| {
+            let membership = match link.family {
+                Family::V4 => Membership::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                Family::V6 => Membership::V6,
+            };
+            let name = format!("eth{}", link.index.get());
+            let subnets = Vec::new();
+            let joined = Joined {
+                name,
+                membership,
+                subnets,
+            };
+            (link, joined)
+        });
+        Net {
+            v4: None,
+            v6: None,
+            only: Vec::new(),
+            joined: joined.collect(),
+            unserved: Vec::new(),
+            addrs: Vec::new(),
+            names: Vec::new(),
+            #[cfg(target_os = "linux")]
+            events: None,
+            #[cfg(target_os = "linux")]
+            dumper: None,
+            #[cfg(target_os = "linux")]
+            event_buf: Vec::new(),
+            drops: DropLog::default(),
+            events_rest: Backoff::default(),
+            full: Default::default(),
+            replies: Default::default(),
+            listing: FailureLog::default(),
+            log: Vec::new(),
+            dropped: false,
+        }
+    }
+
+    /// Stops serving a link whose send failed, noting it for
+    /// `take_dropped`, so a rescan soon joins it again if it is still
+    /// there.
+    pub fn drop_link(&mut self, link: Link) {
+        self.leave(link);
+        self.dropped = true;
+    }
+
+    /// Whether `drop_link` dropped a link since the last call.
+    pub fn take_dropped(&mut self) -> bool {
+        std::mem::take(&mut self.dropped)
+    }
+
     /// Stops serving a link. The next rescan joins it again if it is still
-    /// there, which is how a link whose sends failed gets another chance.
-    pub fn leave(&mut self, link: Link) {
+    /// there.
+    fn leave(&mut self, link: Link) {
         let Some(joined) = self.joined.remove(&link) else {
             return;
         };
@@ -465,7 +616,9 @@ impl Net {
             .flatten()
             .map(|sock| sock.as_raw_fd());
         #[cfg(target_os = "linux")]
-        let sockets = sockets.chain(self.events.iter().map(|sock| sock.as_raw_fd()));
+        let sockets = sockets
+            .chain(self.events.iter().map(|sock| sock.as_raw_fd()))
+            .chain(self.dumper.iter().map(crate::netlink::Dumper::fd));
         sockets.collect()
     }
 
@@ -510,12 +663,14 @@ impl Net {
         self.events_rest.until(now)
     }
 
-    /// The name of a served interface, for logs.
+    /// The name of an interface wanted at the last rescan, for logs. Not
+    /// only a joined one: an address change on an interface whose join
+    /// failed is logged too.
     pub fn interface_name(&self, index: IfIndex) -> Option<&str> {
-        self.joined
+        self.names
             .iter()
-            .find(|(link, _)| link.index == index)
-            .map(|(_, joined)| joined.name.as_str())
+            .find(|(i, _)| *i == index)
+            .map(|(_, name)| name.as_str())
     }
 
     /// Lines to log since the last call.
@@ -563,7 +718,10 @@ impl Net {
 }
 
 /// A socket bound to the mDNS port for one family, shared with the host's
-/// own responder through `SO_REUSEADDR` and `SO_REUSEPORT`.
+/// own responder through `SO_REUSEADDR` and `SO_REUSEPORT`. Multicast
+/// reaches both; a unicast packet to the port reaches only one of them
+/// (RFC 6762 section 15.1), so nothing here relies on receiving unicast
+/// (see "Sharing port 5353" in docs/design.md).
 fn socket(family: Family) -> io::Result<PktInfoUdpSocket> {
     let (domain, bind) = match family {
         Family::V4 => (
@@ -581,19 +739,24 @@ fn socket(family: Family) -> io::Result<PktInfoUdpSocket> {
     // The loop waits on every descriptor at once, then reads each until it
     // is empty.
     sock.set_nonblocking(true)?;
+    // A std handle on the same socket, for the options PktInfoUdpSocket
+    // does not offer. Dropping it closes only the duplicate descriptor.
+    let handle = sock.try_clone_std()?;
+    // Every response leaves with a TTL (hop limit) of 255, unicast ones
+    // too: RFC 6762 section 11 says SHOULD, for older queriers that check
+    // it to tell a packet from the local link.
     match family {
         Family::V4 => {
             sock.set_multicast_loop_v4(true)?;
             sock.set_multicast_ttl_v4(255)?;
+            handle.set_ttl(255)?;
         }
         Family::V6 => {
-            // A std handle on the same socket, for the option
-            // PktInfoUdpSocket does not offer. Dropping it closes only the
-            // duplicate descriptor.
-            let handle = sock.try_clone_std()?;
+            let handle = SockRef::from(&handle);
             // Otherwise Linux delivers IPv4 traffic here too, as mapped
             // addresses, and every IPv4 query would be answered twice.
-            SockRef::from(&handle).set_only_v6(true)?;
+            handle.set_only_v6(true)?;
+            handle.set_unicast_hops_v6(255)?;
             sock.set_multicast_loop_v6(true)?;
             sock.set_multicast_hops_v6(255)?;
         }
@@ -671,19 +834,45 @@ fn unserved(only: &[String], want: &BTreeMap<Link, Joined>) -> Vec<String> {
 /// What to do with a packet from `source` on `link`.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
-    Accept,
+    /// Hand it to the responder; `unicast` says whether a reply may go to
+    /// the source by unicast.
+    Accept { unicast: bool },
     /// A link we do not serve, or whose join failed: Linux delivers group
     /// traffic joined by any socket to every one, so this is normal.
     Unserved,
-    /// A served link, but the source is not on-link there.
+    /// A served link, but the packet was sent straight to us (not to the
+    /// mDNS group) from a source that is not on-link there.
     OffLink,
 }
 
-fn verdict(joined: &BTreeMap<Link, Joined>, link: Link, source: IpAddr) -> Verdict {
-    match joined.get(&link) {
-        None => Verdict::Unserved,
-        Some(j) if on_link(source, &j.subnets) => Verdict::Accept,
-        Some(_) => Verdict::OffLink,
+/// The verdict on a packet from `source` to `dest` on `link` (RFC 6762
+/// section 11). A packet sent to the mDNS group is deemed to come from the
+/// link whatever its source: link-scope multicast is never routed, and
+/// overlaid subnets or a wrong netmask must not cost a device its answers.
+/// Any other packet (unicast, or a broadcast) must come from on-link.
+///
+/// A reply goes by unicast only to a source on one of the link's subnets,
+/// or IPv6 link-local; any other is answered by multicast, which the
+/// querier hears wherever it thinks it is (section 11: "SHOULD elect to
+/// respond by multicast anyway"). That includes an IPv4 link-local source
+/// on a link without a 169.254/16 address, which has no route for a reply.
+fn verdict(joined: &BTreeMap<Link, Joined>, link: Link, source: IpAddr, dest: IpAddr) -> Verdict {
+    let Some(j) = joined.get(&link) else {
+        return Verdict::Unserved;
+    };
+    let unicast = reachable(source, &j.subnets);
+    if to_group(dest) || on_link(source, &j.subnets) {
+        Verdict::Accept { unicast }
+    } else {
+        Verdict::OffLink
+    }
+}
+
+/// Whether `dest` is the mDNS group of its family.
+fn to_group(dest: IpAddr) -> bool {
+    match dest {
+        IpAddr::V4(v4) => v4 == GROUP_V4,
+        IpAddr::V6(v6) => v6 == GROUP_V6,
     }
 }
 
@@ -790,13 +979,22 @@ impl FailureLog {
 
 /// Whether `source` is on-link for an interface with these addresses:
 /// inside one of its subnets, or link-local (169.254/16, fe80::/10), which
-/// RFC 6762 section 11 counts as on-link wherever it arrives.
+/// is on-link wherever it arrives.
 fn on_link(source: IpAddr, subnets: &[(IpAddr, u8)]) -> bool {
-    let link_local = match source {
-        IpAddr::V4(v4) => v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_unicast_link_local(),
-    };
-    if link_local {
+    match source {
+        IpAddr::V4(v4) => v4.is_link_local() || reachable(source, subnets),
+        IpAddr::V6(_) => reachable(source, subnets),
+    }
+}
+
+/// Whether a unicast reply to `source` can leave an interface with these
+/// addresses: `source` is inside one of its subnets, or IPv6 link-local
+/// (the received address carries the interface as its scope). An IPv4
+/// link-local source qualifies only through a 169.254/16 subnet here.
+fn reachable(source: IpAddr, subnets: &[(IpAddr, u8)]) -> bool {
+    if let IpAddr::V6(v6) = source
+        && v6.is_unicast_link_local()
+    {
         return true;
     }
     subnets
@@ -820,6 +1018,17 @@ fn same_prefix(a: IpAddr, b: IpAddr, prefix: u8) -> bool {
         }
         _ => false,
     }
+}
+
+/// The name of each interface in `want`, once, in index order.
+fn interface_names(want: &BTreeMap<Link, Joined>) -> Vec<(IfIndex, String)> {
+    let mut names: Vec<(IfIndex, String)> = Vec::new();
+    for (link, joined) in want {
+        if names.last().is_none_or(|(index, _)| *index != link.index) {
+            names.push((link.index, joined.name.clone()));
+        }
+    }
+    names
 }
 
 /// Each served interface's stable addresses, sorted.
@@ -940,9 +1149,9 @@ impl Settle {
 }
 
 #[cfg(target_os = "linux")]
-fn list_interfaces() -> io::Result<Vec<Interface>> {
-    use crate::netlink::{self, IFF_LOOPBACK, IFF_MULTICAST, IFF_POINTOPOINT, IFF_RUNNING, IFF_UP};
-    let (links, addrs) = netlink::dump()?;
+fn list_interfaces(dumper: &mut crate::netlink::Dumper) -> io::Result<Vec<Interface>> {
+    use crate::netlink::{IFF_LOOPBACK, IFF_MULTICAST, IFF_POINTOPOINT, IFF_RUNNING, IFF_UP};
+    let (links, addrs) = dumper.dump()?;
     Ok(addrs
         .into_iter()
         .filter_map(|a| {
@@ -1181,6 +1390,12 @@ mod tests {
         );
     }
 
+    /// The mDNS group, and an address of ours, as a packet's destination.
+    const TO_GROUP: IpAddr = IpAddr::V4(GROUP_V4);
+    const TO_US: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    const ANSWER_BY_UNICAST: Verdict = Verdict::Accept { unicast: true };
+    const ANSWER_BY_MULTICAST: Verdict = Verdict::Accept { unicast: false };
+
     #[test]
     fn packets_are_accepted_only_from_on_link_senders_on_served_links() {
         let ifs = [iface("enp1s0", 2, "192.0.2.10")];
@@ -1190,31 +1405,105 @@ mod tests {
             family: Family::V4,
         };
         let source = "192.0.2.20".parse().unwrap();
-        assert_eq!(verdict(&joined, ENP1S0_V4, source), Verdict::Accept);
-        assert_eq!(verdict(&joined, other, source), Verdict::Unserved);
+        for dest in [TO_GROUP, TO_US] {
+            assert_eq!(verdict(&joined, ENP1S0_V4, source, dest), ANSWER_BY_UNICAST);
+            assert_eq!(verdict(&joined, other, source, dest), Verdict::Unserved);
+        }
+        // Sent straight to us from off-link: dropped (RFC 6762 section 5.5).
         let far = "198.51.100.7".parse().unwrap();
-        assert_eq!(verdict(&joined, ENP1S0_V4, far), Verdict::OffLink);
+        assert_eq!(verdict(&joined, ENP1S0_V4, far, TO_US), Verdict::OffLink);
+        // So is a broadcast from off-link: only the group is link-scoped.
+        let broadcast = "255.255.255.255".parse().unwrap();
+        assert_eq!(
+            verdict(&joined, ENP1S0_V4, far, broadcast),
+            Verdict::OffLink
+        );
+        // Another multicast group is not the mDNS one.
+        let group = "239.255.0.1".parse().unwrap();
+        assert_eq!(verdict(&joined, ENP1S0_V4, far, group), Verdict::OffLink);
+    }
+
+    /// RFC 6762 section 11: a packet to the group is from the link whatever
+    /// its source, and its sender, if off our subnets, is answered by
+    /// multicast.
+    #[test]
+    fn group_packets_from_off_subnet_senders_are_accepted_for_multicast_replies() {
+        let ifs = [
+            iface("enp1s0", 2, "192.0.2.10"),
+            iface("enp1s0", 2, "2001:db8::10"),
+        ];
+        let joined = wanted(&ifs, &[], &BOTH);
+        let far = "198.51.100.7".parse().unwrap();
+        assert_eq!(
+            verdict(&joined, ENP1S0_V4, far, TO_GROUP),
+            ANSWER_BY_MULTICAST
+        );
+        // IPv6: a prefix the host lacks (no router advertisements taken).
+        let v6 = Link {
+            index: IfIndex::of(2),
+            family: Family::V6,
+        };
+        let group = IpAddr::V6(GROUP_V6);
+        let us = "2001:db8::10".parse().unwrap();
+        let foreign = "2001:db8:1::7".parse().unwrap();
+        assert_eq!(verdict(&joined, v6, foreign, group), ANSWER_BY_MULTICAST);
+        assert_eq!(verdict(&joined, v6, foreign, us), Verdict::OffLink);
+        let ours = "2001:db8::7".parse().unwrap();
+        assert_eq!(verdict(&joined, v6, ours, group), ANSWER_BY_UNICAST);
+        // IPv6 link-local is always reachable: the source carries its scope.
+        let link_local = "fe80::7".parse().unwrap();
+        assert_eq!(verdict(&joined, v6, link_local, us), ANSWER_BY_UNICAST);
+        assert_eq!(verdict(&joined, v6, link_local, group), ANSWER_BY_UNICAST);
+    }
+
+    #[test]
+    fn ipv4_link_local_senders_get_unicast_only_with_a_link_local_address() {
+        let auto = "169.254.10.20".parse().unwrap();
+        // No 169.254/16 address, so no route back: on-link, but answered
+        // by multicast, whether it asked the group or us.
+        let ifs = [iface("enp1s0", 2, "192.0.2.10")];
+        let joined = wanted(&ifs, &[], &BOTH);
+        for dest in [TO_GROUP, TO_US] {
+            assert_eq!(verdict(&joined, ENP1S0_V4, auto, dest), ANSWER_BY_MULTICAST);
+        }
+        // With one, a unicast reply can go.
+        let mut own = iface("enp1s0", 2, "169.254.1.1");
+        own.prefix = 16;
+        let joined = wanted(&[iface("enp1s0", 2, "192.0.2.10"), own], &[], &BOTH);
+        for dest in [TO_GROUP, TO_US] {
+            assert_eq!(verdict(&joined, ENP1S0_V4, auto, dest), ANSWER_BY_UNICAST);
+        }
+    }
+
+    #[test]
+    fn only_subnet_and_ipv6_link_local_sources_are_reachable_by_unicast() {
+        let subnets = [subnet("192.0.2.10", 24), subnet("2001:db8::10", 64)];
+        for (source, expected) in [
+            ("192.0.2.200", true),
+            ("198.51.100.7", false),
+            ("169.254.10.20", false),
+            ("2001:db8::99", true),
+            ("2001:db8:1::1", false),
+            ("fe80::1234", true),
+        ] {
+            assert_eq!(
+                reachable(source.parse().unwrap(), &subnets),
+                expected,
+                "{source}"
+            );
+        }
+        assert!(reachable(
+            "169.254.10.20".parse().unwrap(),
+            &[subnet("169.254.1.1", 16)]
+        ));
     }
 
     /// A `Net` without sockets, so every join fails, that has already
     /// joined `joined`.
     fn unconnected(joined: BTreeMap<Link, Joined>) -> Net {
-        Net {
-            v4: None,
-            v6: None,
-            only: Vec::new(),
-            joined,
-            unserved: Vec::new(),
-            addrs: Vec::new(),
-            #[cfg(target_os = "linux")]
-            events: None,
-            #[cfg(target_os = "linux")]
-            event_buf: Vec::new(),
-            drops: DropLog::default(),
-            events_rest: Backoff::default(),
-            full: Default::default(),
-            log: Vec::new(),
-        }
+        let mut net = Net::without_sockets(&[]);
+        net.joined = joined;
+        net
     }
 
     #[test]
@@ -1228,7 +1517,40 @@ mod tests {
         assert!(log[0].starts_with("cannot join enp1s0 (IPv4): "), "{log:?}");
         assert!(!net.serves(ENP1S0_V4));
         let source = "192.0.2.20".parse().unwrap();
-        assert_eq!(verdict(&net.joined, ENP1S0_V4, source), Verdict::Unserved);
+        assert_eq!(
+            verdict(&net.joined, ENP1S0_V4, source, TO_GROUP),
+            Verdict::Unserved
+        );
+    }
+
+    #[test]
+    fn failed_replies_are_logged_first_then_once_a_minute_per_family() {
+        let mut net = unconnected(BTreeMap::new());
+        assert_eq!(net.reply_failed(Family::V4, 0), Some(0));
+        for now in 1..100 {
+            assert_eq!(net.reply_failed(Family::V4, now), None);
+        }
+        // The other family has a log of its own.
+        assert_eq!(net.reply_failed(Family::V6, 50), Some(0));
+        assert_eq!(net.reply_failed(Family::V4, 59_999), None);
+        assert_eq!(net.reply_failed(Family::V4, 60_000), Some(100));
+        assert_eq!(net.reply_failed(Family::V4, 60_001), None);
+    }
+
+    #[test]
+    fn a_link_dropped_for_a_failed_send_is_noted_once() {
+        let ifs = [iface("enp1s0", 2, "192.0.2.10")];
+        let mut net = unconnected(wanted(&ifs, &[], &[Family::V4]));
+        assert!(!net.take_dropped());
+        net.drop_link(ENP1S0_V4);
+        assert!(!net.serves(ENP1S0_V4));
+        assert!(net.take_dropped());
+        assert!(!net.take_dropped());
+        // A rescan's own leaving is not a failure to make up for.
+        let mut net = unconnected(wanted(&ifs, &[], &[Family::V4]));
+        net.reconcile(&[], &[Family::V4]);
+        assert!(!net.serves(ENP1S0_V4));
+        assert!(!net.take_dropped());
     }
 
     #[test]
@@ -1252,13 +1574,85 @@ mod tests {
     }
 
     #[test]
+    fn an_interface_whose_join_failed_still_has_a_name_for_the_addresses_line() {
+        let ifs = [iface("enp1s0", 2, "192.0.2.10")];
+        let mut net = unconnected(BTreeMap::new());
+        let scan = net.reconcile(&ifs, &[Family::V4]);
+        assert!(!net.serves(ENP1S0_V4));
+        // The address change is reported, and its interface has a name.
+        assert_eq!(scan.addresses.len(), 1);
+        assert_eq!(net.interface_name(scan.addresses[0].0), Some("enp1s0"));
+        // An interface no longer wanted has none; its "left" line says it.
+        net.reconcile(&[], &[Family::V4]);
+        assert_eq!(net.interface_name(IfIndex::of(2)), None);
+    }
+
+    #[test]
+    fn an_interrupted_listing_changes_nothing_and_asks_for_a_retry() {
+        let ifs = [iface("enp1s0", 2, "192.0.2.10")];
+        let mut net = unconnected(BTreeMap::new());
+        net.reconcile(&ifs, &[Family::V4]);
+        net.take_log();
+        let before = net.addrs.clone();
+        let scan = net.rescan_with(Err(io::ErrorKind::Interrupted.into()), 0);
+        assert!(scan.retry_soon);
+        assert!(scan.added.is_empty() && scan.removed.is_empty() && scan.addresses.is_empty());
+        assert_eq!(net.addrs, before);
+        let log = net.take_log();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].starts_with("cannot list interfaces: "), "{log:?}");
+        // So is one whose reply never came.
+        let scan = net.rescan_with(Err(io::ErrorKind::TimedOut.into()), 1);
+        assert!(scan.retry_soon);
+        // Other failures wait for the usual rescan.
+        let scan = net.rescan_with(Err(io::ErrorKind::InvalidData.into()), 2);
+        assert!(!scan.retry_soon);
+    }
+
+    #[test]
+    fn repeated_listing_failures_are_logged_first_then_once_a_minute() {
+        let mut net = unconnected(BTreeMap::new());
+        let fail = |net: &mut Net, now| {
+            net.rescan_with(Err(io::ErrorKind::TimedOut.into()), now);
+            net.take_log()
+        };
+        assert_eq!(fail(&mut net, 0).len(), 1);
+        assert!(fail(&mut net, 2_000).is_empty());
+        assert!(fail(&mut net, 59_999).is_empty());
+        let log = fail(&mut net, 60_000);
+        assert_eq!(log.len(), 1);
+        assert!(log[0].ends_with("(2 more not logged)"), "{log:?}");
+        // A good listing ends the run: the next failure is a first again.
+        net.rescan_with(Ok(Vec::new()), 61_000);
+        net.take_log();
+        assert_eq!(fail(&mut net, 62_000).len(), 1);
+    }
+
+    #[test]
+    fn interface_names_come_once_per_interface() {
+        let ifs = [
+            iface("enp1s0", 2, "192.0.2.10"),
+            iface("enp1s0", 2, "2001:db8::10"),
+            iface("enp2s0", 3, "198.51.100.10"),
+        ];
+        let want = wanted(&ifs, &[], &[Family::V4, Family::V6]);
+        assert_eq!(
+            interface_names(&want),
+            [
+                (IfIndex::of(2), "enp1s0".to_string()),
+                (IfIndex::of(3), "enp2s0".to_string())
+            ]
+        );
+    }
+
+    #[test]
     fn an_address_only_change_keeps_the_link_and_updates_its_subnets() {
         let before = [iface("enp1s0", 2, "192.0.2.10")];
         let mut net = unconnected(wanted(&before, &[], &[Family::V4]));
         net.reconcile(&before, &[Family::V4]);
         let new_source = "198.51.100.20".parse().unwrap();
         assert_eq!(
-            verdict(&net.joined, ENP1S0_V4, new_source),
+            verdict(&net.joined, ENP1S0_V4, new_source, TO_US),
             Verdict::OffLink
         );
         // A second address, and a wider prefix on the first, which stays
@@ -1275,7 +1669,10 @@ mod tests {
             net.joined[&ENP1S0_V4].subnets,
             [subnet("192.0.2.10", 16), subnet("198.51.100.10", 24)]
         );
-        assert_eq!(verdict(&net.joined, ENP1S0_V4, new_source), Verdict::Accept);
+        assert_eq!(
+            verdict(&net.joined, ENP1S0_V4, new_source, TO_US),
+            ANSWER_BY_UNICAST
+        );
         // A new membership address does mean joining again, which fails
         // here and drops the link.
         let moved = [iface("enp1s0", 2, "192.0.2.11")];

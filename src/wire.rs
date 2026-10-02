@@ -139,7 +139,7 @@ impl Name {
     }
 
     /// The labels, in order, without length bytes or the root.
-    fn labels(&self) -> impl Iterator<Item = &[u8]> {
+    pub fn labels(&self) -> impl Iterator<Item = &[u8]> {
         let mut rest = &self.0[..];
         std::iter::from_fn(move || {
             let (&len, tail) = rest.split_first()?;
@@ -156,21 +156,6 @@ impl Name {
             .labels()
             .fold((0, None), |(count, _), label| (count + 1, Some(label)));
         count >= 2 && last.is_some_and(|l| l.eq_ignore_ascii_case(b"local"))
-    }
-
-    /// This name with `base` appended: `seerr` under `myhost.local` is
-    /// `seerr.myhost.local`. Fails if the result is too long.
-    pub fn under(&self, base: &Name) -> Result<Name, NameError> {
-        // Both are valid names, so only the length can be wrong.
-        let labels = &self.0[..self.0.len() - 1];
-        let len = labels.len() + base.0.len();
-        if len > MAX_NAME {
-            return Err(NameError::TooLong);
-        }
-        let mut wire = Vec::with_capacity(len);
-        wire.extend_from_slice(labels);
-        wire.extend_from_slice(&base.0);
-        Ok(Name::from_wire(wire.into_boxed_slice()))
     }
 
     /// Uncompressed wire form, which record comparison (RFC 6762 section
@@ -361,9 +346,17 @@ pub struct Message {
     pub additionals: Vec<Record>,
 }
 
-/// Parses a whole message. `None` for anything malformed, and for messages
-/// with a non-zero opcode or rcode, which RFC 6762 section 18 says to ignore.
-/// Bytes after the last record are ignored.
+/// Parses a whole message. `None` for a malformed message (truncated, a bad
+/// name outside rdata, counts past the end), and for messages with a
+/// non-zero opcode or rcode, which RFC 6762 section 18 says to ignore. Bytes
+/// after the last record are ignored.
+///
+/// A well-framed record whose CNAME or NSEC rdata cannot be decoded (a bad
+/// name in it, a malformed type bitmap, bytes past the name) is left out,
+/// and the rest of the message kept: RFC 6762 section 6.1 says not to
+/// ignore a whole message for an NSEC record that cannot be parsed. It is
+/// left out rather than kept as raw bytes because those can hold a
+/// compression pointer into this packet, meaningless anywhere else.
 pub fn parse(packet: &[u8]) -> Option<Message> {
     let mut r = Reader { packet, pos: 0 };
     let id = r.u16()?;
@@ -392,7 +385,7 @@ pub fn parse(packet: &[u8]) -> Option<Message> {
     let sections = [&mut msg.answers, &mut msg.authorities, &mut msg.additionals];
     for (count, section) in counts[1..].iter().zip(sections) {
         for _ in 0..*count {
-            section.push(r.record()?);
+            section.extend(r.record()?);
         }
     }
     Some(msg)
@@ -403,9 +396,10 @@ struct Reader<'a> {
     pos: usize,
 }
 
-impl Reader<'_> {
-    fn bytes(&mut self, n: usize) -> Option<&[u8]> {
-        let bytes = self.packet.get(self.pos..self.pos.checked_add(n)?)?;
+impl<'a> Reader<'a> {
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let packet = self.packet;
+        let bytes = packet.get(self.pos..self.pos.checked_add(n)?)?;
         self.pos += n;
         Some(bytes)
     }
@@ -426,47 +420,62 @@ impl Reader<'_> {
         Some(name)
     }
 
-    fn record(&mut self) -> Option<Record> {
+    /// Reads one record. `None` if the record itself is malformed: a bad
+    /// owner name, or the fixed fields or rdata running past the end.
+    /// `Some(None)` for a well-framed record whose rdata does not decode,
+    /// which `parse` leaves out; the reader is past it either way.
+    fn record(&mut self) -> Option<Option<Record>> {
         let name = self.name()?;
         let rtype = RType(self.u16()?);
         let class = self.u16()?;
         let ttl = self.u32()?;
         let len = usize::from(self.u16()?);
         let start = self.pos;
-        let raw = self.bytes(len)?.to_vec();
-        let rdata = match rtype {
-            RType::CNAME => {
-                // The target may use compression, so it is read from the
-                // whole packet, and must fill the rdata exactly.
-                let (target, end) = read_name(self.packet, start)?;
-                if end != start + len {
-                    return None;
-                }
-                RData::Cname(target)
-            }
-            RType::A if len == 4 => RData::A(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
-            RType::AAAA if len == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&raw);
-                RData::Aaaa(Ipv6Addr::from(octets))
-            }
-            RType::NSEC => {
-                // The next name may be compressed (RFC 6762 section 18.14);
-                // the type bitmap fills the rest of the rdata.
-                let (next, end) = read_name(self.packet, start)?;
-                let types = bitmap_types(self.packet.get(end..start + len)?)?;
-                RData::Nsec { next, types }
-            }
-            _ => RData::Other(Unknown { rtype, bytes: raw }),
-        };
-        Some(Record {
+        let raw = self.bytes(len)?;
+        let rdata = rdata(self.packet, rtype, start, raw);
+        Some(rdata.map(|rdata| Record {
             name,
             class: Class(class & !CACHE_FLUSH_BIT),
             cache_flush: class & CACHE_FLUSH_BIT != 0,
             ttl,
             rdata,
-        })
+        }))
     }
+}
+
+/// Decodes the rdata `raw` of a record of `rtype`, found at `start` in
+/// `packet`. `None` if a CNAME or NSEC does not decode; any other type
+/// always does, an address record of the wrong length as raw bytes.
+fn rdata(packet: &[u8], rtype: RType, start: usize, raw: &[u8]) -> Option<RData> {
+    let end_of_rdata = start + raw.len();
+    Some(match rtype {
+        RType::CNAME => {
+            // The target may use compression, so it is read from the whole
+            // packet, and must fill the rdata exactly.
+            let (target, end) = read_name(packet, start)?;
+            if end != end_of_rdata {
+                return None;
+            }
+            RData::Cname(target)
+        }
+        RType::A if raw.len() == 4 => RData::A(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
+        RType::AAAA if raw.len() == 16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(raw);
+            RData::Aaaa(Ipv6Addr::from(octets))
+        }
+        RType::NSEC => {
+            // The next name may be compressed (RFC 6762 section 18.14); the
+            // type bitmap fills the rest of the rdata.
+            let (next, end) = read_name(packet, start)?;
+            let types = bitmap_types(packet.get(end..end_of_rdata)?)?;
+            RData::Nsec { next, types }
+        }
+        _ => RData::Other(Unknown {
+            rtype,
+            bytes: raw.to_vec(),
+        }),
+    })
 }
 
 /// Reads the name at `pos`, returning it and the offset just past it.
@@ -569,8 +578,8 @@ fn type_bitmap(types: &Types) -> Vec<u8> {
 
 /// Encodes `msg`. Responses carry QR and AA (every answer here is
 /// authoritative), queries no flags, and either TC if `truncated`. Names
-/// are compressed against earlier ones in the message, which keeps a probe
-/// for many aliases under one target small.
+/// are compressed against earlier ones in the message, so a packet about
+/// many aliases spells out `.local`, and any other shared suffix, once.
 pub fn encode(msg: &Message) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(512),
@@ -833,11 +842,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cname_rdata_with_bytes_past_the_name() {
+    fn skips_cname_rdata_with_bytes_past_the_name() {
         let mut p = header(0x8400, [0, 1, 0, 0]);
         p.extend_from_slice(b"\x03app\x05local\x00");
         p.extend_from_slice(&[0, 5, 0, 1, 0, 0, 0, 120, 0, 3, 0xC0, 0x10, 0]);
-        assert_eq!(parse(&p), None);
+        assert_eq!(parse(&p).unwrap().answers, []);
+    }
+
+    #[test]
+    fn skips_a_cname_whose_target_does_not_parse() {
+        // A pointer forward, past itself, and a target running past the
+        // rdata: each record is left out, the message kept.
+        for rdata in [&b"\xC0\x30"[..], b"\x03app"] {
+            let mut p = header(0x8400, [0, 1, 0, 0]);
+            p.extend_from_slice(b"\x03app\x05local\x00");
+            p.extend_from_slice(&[0, 5, 0, 1, 0, 0, 0, 120, 0, rdata.len() as u8]);
+            p.extend_from_slice(rdata);
+            p.extend_from_slice(b"\x05local\x00");
+            assert_eq!(parse(&p).unwrap().answers, [], "rdata {rdata:?}");
+        }
     }
 
     #[test]
@@ -945,16 +968,6 @@ mod tests {
     }
 
     #[test]
-    fn under_appends_the_base_and_checks_length() {
-        assert_eq!(
-            name("api.seerr").under(&name("myhost.local")),
-            Ok(name("api.seerr.myhost.local"))
-        );
-        let long = name(&vec!["a".repeat(60); 4].join("."));
-        assert_eq!(long.under(&name("myhost.local")), Err(NameError::TooLong));
-    }
-
-    #[test]
     fn address_and_nsec_records_round_trip() {
         let msg = Message {
             is_response: true,
@@ -1020,24 +1033,84 @@ mod tests {
         p
     }
 
+    /// Asserts that `packet` parses, without its one record: an NSEC record
+    /// that cannot be decoded is left out, not the whole message (RFC 6762
+    /// section 6.1).
+    fn skips_the_record(packet: &[u8]) {
+        let msg = parse(packet).expect("the message is kept");
+        assert_eq!(msg.answers, []);
+        assert!(msg.is_response);
+    }
+
     #[test]
-    fn rejects_malformed_nsec_bitmaps() {
+    fn skips_malformed_nsec_bitmaps() {
         for bitmap in [&[0u8, 0][..], &[0, 33], &[0, 2, 0x40]] {
-            assert_eq!(parse(&nsec_packet(bitmap)), None, "bitmap {bitmap:?}");
+            skips_the_record(&nsec_packet(bitmap));
         }
     }
 
     #[test]
-    fn rejects_nsec_windows_out_of_order() {
+    fn skips_nsec_windows_out_of_order() {
         // Window 1 (type 257) before window 0 (type 1).
-        let bitmap = [1, 1, 0x40, 0, 1, 0x40];
-        assert_eq!(parse(&nsec_packet(&bitmap)), None);
+        skips_the_record(&nsec_packet(&[1, 1, 0x40, 0, 1, 0x40]));
     }
 
     #[test]
-    fn rejects_a_repeated_nsec_window() {
-        let bitmap = [0, 1, 0x40, 0, 1, 0x20];
-        assert_eq!(parse(&nsec_packet(&bitmap)), None);
+    fn skips_a_repeated_nsec_window() {
+        skips_the_record(&nsec_packet(&[0, 1, 0x40, 0, 1, 0x20]));
+    }
+
+    #[test]
+    fn skips_an_nsec_whose_next_name_does_not_parse() {
+        // A pointer forward, and a label type never deployed.
+        for next in [&b"\xC0\x40"[..], b"\x40"] {
+            let mut p = header(0x8400, [0, 1, 0, 0]);
+            p.extend_from_slice(b"\x03app\x05local\x00");
+            p.extend_from_slice(&[0, 47, 0, 1, 0, 0, 0, 120, 0, next.len() as u8]);
+            p.extend_from_slice(next);
+            skips_the_record(&p);
+        }
+    }
+
+    #[test]
+    fn an_undecodable_nsec_leaves_the_rest_of_the_message() {
+        // A response for app.local: a bad NSEC, then an A record that
+        // points back at the owner name, in every section.
+        let bad = [0, 47, 0x80, 1, 0, 0, 0, 120, 0, 4, 0xC0, 0x0C, 0, 0];
+        let good = [0xC0, 0x0C, 0, 1, 0x80, 1, 0, 0, 0, 120, 0, 4, 192, 0, 2, 10];
+        let mut p = header(0x8400, [0, 2, 2, 2]);
+        p.extend_from_slice(b"\x03app\x05local\x00");
+        p.extend_from_slice(&bad);
+        p.extend_from_slice(&good);
+        for _ in 0..2 {
+            p.extend_from_slice(&good[..2]);
+            p.extend_from_slice(&bad);
+            p.extend_from_slice(&good);
+        }
+        let msg = parse(&p).unwrap();
+        let a = Record {
+            name: name("app.local"),
+            class: Class::IN,
+            cache_flush: true,
+            ttl: 120,
+            rdata: RData::A(Ipv4Addr::new(192, 0, 2, 10)),
+        };
+        for section in [&msg.answers, &msg.authorities, &msg.additionals] {
+            assert_eq!(section, std::slice::from_ref(&a));
+        }
+        // What is kept encodes and parses back the same, as the fuzz
+        // target checks.
+        assert_eq!(parse(&encode(&msg)), Some(msg));
+    }
+
+    #[test]
+    fn an_nsec_running_past_the_packet_still_fails_the_message() {
+        // The framing is broken, not just the rdata: the length says 10
+        // bytes, 4 are there.
+        let mut p = header(0x8400, [0, 1, 0, 0]);
+        p.extend_from_slice(b"\x03app\x05local\x00");
+        p.extend_from_slice(&[0, 47, 0, 1, 0, 0, 0, 120, 0, 10, 0xC0, 0x0C, 0, 1]);
+        assert_eq!(parse(&p), None);
     }
 
     #[test]
@@ -1066,6 +1139,29 @@ mod tests {
             msg.answers[0].rdata,
             RData::other(RType::A, vec![192, 0, 2]).unwrap()
         );
+    }
+
+    #[test]
+    fn aaaa_records_of_the_wrong_length_stay_raw() {
+        let mut p = header(0x8400, [0, 1, 0, 0]);
+        p.extend_from_slice(b"\x03app\x05local\x00");
+        p.extend_from_slice(&[0, 28, 0, 1, 0, 0, 0, 120, 0, 4, 32, 1, 13, 184]);
+        let msg = parse(&p).unwrap();
+        assert_eq!(
+            msg.answers[0].rdata,
+            RData::other(RType::AAAA, vec![32, 1, 13, 184]).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_nsec_with_an_empty_bitmap_has_no_types_and_round_trips() {
+        let msg = parse(&nsec_packet(&[])).unwrap();
+        let RData::Nsec { next, types } = &msg.answers[0].rdata else {
+            panic!("not an NSEC: {:?}", msg.answers[0].rdata);
+        };
+        assert_eq!(*next, name("app.local"));
+        assert!(types.is_empty());
+        assert_eq!(parse(&encode(&msg)).unwrap(), msg);
     }
 
     #[test]
@@ -1309,15 +1405,9 @@ mod tests {
             };
             assert_eq!(parse(&encode(&msg)), Some(msg));
         }
-        // One byte more is too long, as text or under a base.
+        // One byte more is too long.
         let over = format!("{label}.{label}.{label}.{}", "b".repeat(62));
         assert_eq!(Name::parse(&over), Err(NameError::TooLong));
-        let base = name(&format!("{label}.{label}.{label}"));
-        assert_eq!(
-            name(&"b".repeat(61)).under(&base).unwrap().to_wire().len(),
-            255
-        );
-        assert_eq!(name(&"b".repeat(62)).under(&base), Err(NameError::TooLong));
     }
 
     #[test]

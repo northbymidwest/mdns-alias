@@ -1,5 +1,5 @@
-//! Publish extra mDNS host names for this host, as address records by
-//! default or as CNAMEs of its own name with `--cname`. The program is
+//! Publish extra mDNS host names for this host, answered with its
+//! addresses (A, AAAA, and NSEC for a missing family). The program is
 //! [`run`]; the binary in `main.rs` only calls it and reports its error.
 //!
 //! Every module is private, so items are plain `pub` where another module
@@ -34,23 +34,33 @@ pub use app::run;
 pub mod testing {
     /// The DNS codec, for the parse fuzz target and test names.
     pub mod wire {
-        pub use crate::wire::{Message, Name, NameError, encode, parse};
+        pub use crate::wire::{
+            Class, Message, Name, Question, RData, RType, Record, encode, parse,
+        };
     }
 
     /// The netlink parsers, for the netlink fuzz target, and on Linux the
     /// sockets, for the notification and seccomp tests.
     pub mod netlink {
-        pub use crate::netlink::{
-            AddrInfo, Drained, LinkInfo, Malformed, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV6_IFADDR,
-            RTNLGRP_LINK, messages, parse_addr, parse_link,
-        };
         #[cfg(target_os = "linux")]
-        pub use crate::netlink::{drain, dump, subscribe};
+        pub use crate::netlink::{Dumper, drain, subscribe};
+        pub use crate::netlink::{
+            RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV6_IFADDR, RTNLGRP_LINK, Reply, messages, parse_addr,
+            parse_link, replies,
+        };
     }
 
-    /// The conflict error, which the seccomp tests format under the filter.
+    /// The interface index, for the responder fuzz target.
+    pub mod net {
+        pub use crate::net::IfIndex;
+    }
+
+    /// The conflict notice, which the seccomp tests format under the filter,
+    /// and the responder with what the fuzz target feeds it.
     pub mod responder {
-        pub use crate::responder::Conflict;
+        pub use crate::responder::{
+            Conflict, Dest, Family, Link, MAX_PACKET, MDNS_PORT, Outgoing, Responder, Source,
+        };
     }
 
     pub mod signals {
@@ -59,7 +69,7 @@ pub mod testing {
 
     /// The lockdown and its parts, which the Linux tests apply piecemeal.
     pub mod sandbox {
-        pub use crate::sandbox::{Insn, Landlock, Layer, Report, landlock_ruleset, lock};
+        pub use crate::sandbox::{Landlock, Layer, landlock_ruleset, lock};
         #[cfg(target_os = "linux")]
         pub use crate::sandbox::{lock_with, program};
     }
@@ -69,7 +79,7 @@ pub mod testing {
     #[cfg(target_os = "linux")]
     pub mod sys {
         pub use crate::sys::{
-            POLL_FDS, install_seccomp, landlock_abi, landlock_restrict, poll, poll_entry,
+            CAP_SETPCAP, install_seccomp, landlock_abi, landlock_restrict, poll, poll_entry,
             set_no_new_privs, thread_id,
         };
     }
