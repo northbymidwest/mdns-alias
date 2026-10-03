@@ -35,6 +35,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Plain rustup sets neither; dtolnay/rust-toolchain used to.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
 jobs:
   # Linux is where this runs; macOS is where it gets developed, and has its
   # own responder (mDNSResponder) sharing port 5353. Windows is left out:
@@ -62,11 +67,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-          components: clippy
+      - run: rustup toolchain install stable --profile minimal --no-self-update -c clippy -t "$TARGET" && rustup default stable
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --target "$TARGET"
       - run: cargo build --release --target "$TARGET"
@@ -85,10 +89,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: beta
-          targets: x86_64-unknown-linux-musl
+      - run: rustup toolchain install beta --profile minimal --no-self-update -t x86_64-unknown-linux-musl && rustup default beta
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --target x86_64-unknown-linux-musl
 
@@ -110,10 +111,10 @@ jobs:
           grep -q "^FROM rust:$v-alpine@sha256:[0-9a-f]\{64\} " Dockerfile \
             || { echo "Dockerfile does not build on a digest-pinned rust:$v-alpine" >&2; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: ${{ steps.floor.outputs.version }}
-          targets: x86_64-unknown-linux-musl
+      - run: rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update -t x86_64-unknown-linux-musl && rustup default "$TOOLCHAIN"
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ steps.floor.outputs.version }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --target x86_64-unknown-linux-musl
 
@@ -129,10 +130,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: nightly
-          targets: x86_64-unknown-linux-musl
+      - run: rustup toolchain install nightly --profile minimal --no-self-update -t x86_64-unknown-linux-musl && rustup default nightly
       - run: cargo update -Z direct-minimal-versions
       - run: cargo test --target x86_64-unknown-linux-musl
 
@@ -147,9 +145,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: nightly
+      - run: rustup toolchain install nightly --profile minimal --no-self-update && rustup default nightly
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-fuzz@0.13.2
@@ -238,10 +234,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      - run: rustup toolchain install stable --profile minimal --no-self-update -c rustfmt,clippy && rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings

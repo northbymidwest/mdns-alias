@@ -6,9 +6,8 @@
 # arrive as deadlines: a runner's Node version reaching end of life takes
 # unattended workflows down with it.
 #
-# `dtolnay/rust-toolchain` chooses the compiler through its `toolchain:`
-# input, never through the ref, so a bump here moves the action and not the
-# toolchain. `msrv` reads its version from `Cargo.toml`.
+# The compiler is installed with plain `rustup`, not an action, so nothing
+# here moves it. `msrv` reads its version from `Cargo.toml`.
 #
 # The Dockerfile's base image is `rust:<msrv>-alpine`, pinned by digest. The
 # tag is the MSRV and moves only with `rust-version` (the `msrv` job checks
